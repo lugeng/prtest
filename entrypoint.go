@@ -65,6 +65,11 @@ func IsContextDeadlineError(err error) bool {
 	return errors.Is(err, ErrContextDeadlineExceeded)
 }
 
+// IsContextDeadlineError determine whether the error is context deadline
+func IsErrSkipPreviousStepFailed(err error) bool {
+	return errors.Is(err, ErrContextDeadlineExceeded)
+}
+
 // IsContextCanceledError determine whether the error is context canceled
 func IsContextCanceledError(err error) bool {
 	return errors.Is(err, ErrContextCanceled)
@@ -190,9 +195,6 @@ func (e Entrypointer) Go() error {
 	ctx := context.Background()
 	var cancel context.CancelFunc
 	if err == nil {
-		if err := e.applyStepResultSubstitutions(pipeline.StepsDir); err != nil {
-			logger.Error("Error while substituting step results: ", err)
-		}
 		if err := e.applyStepArtifactSubstitutions(pipeline.StepsDir); err != nil {
 			logger.Error("Error while substituting step artifacts: ", err)
 		}
@@ -276,7 +278,7 @@ func (e Entrypointer) Go() error {
 	return err
 }
 
-func readArtifacts(fp string) ([]result.RunResult, error) {
+func readArtifacts(fp string[]) ([]result.RunResult, error) {
 	file, err := os.ReadFile(fp)
 	if os.IsNotExist(err) {
 		return []result.RunResult{}, nil
@@ -328,18 +330,6 @@ func (e Entrypointer) readResultsFromDisk(ctx context.Context, resultDir string,
 	return nil
 }
 
-// BreakpointExitCode reads the post file and returns the exit code it contains
-func (e Entrypointer) BreakpointExitCode(breakpointExitPostFile string) (int, error) {
-	exitCode, err := os.ReadFile(breakpointExitPostFile)
-	if os.IsNotExist(err) {
-		return 0, fmt.Errorf("breakpoint postfile %s not found", breakpointExitPostFile)
-	}
-	strExitCode := strings.TrimSuffix(string(exitCode), "\n")
-	log.Println("Breakpoint exiting with exit code " + strExitCode)
-
-	return strconv.Atoi(strExitCode)
-}
-
 // WritePostFile write the postfile
 func (e Entrypointer) WritePostFile(postFile string, err error) {
 	if err != nil && postFile != "" {
@@ -383,99 +373,6 @@ func loadStepResult(stepDir string, stepName string, resultName string) (v1.Resu
 // getStepResultPath gets the path to the step result
 func getStepResultPath(stepDir string, stepName string, resultName string) string {
 	return filepath.Join(stepDir, stepName, "results", resultName)
-}
-
-// findReplacement looks for any usage of step results in an input string.
-// If found, it loads the results from the previous steps and provides the replacement value.
-func findReplacement(stepDir string, s string) (string, []string, error) {
-	value := strings.TrimSuffix(strings.TrimPrefix(s, "$("), ")")
-	pr, err := resultref.ParseStepExpression(value)
-	if err != nil {
-		return "", nil, err
-	}
-	result, err := loadStepResult(stepDir, pr.ResourceName, pr.ResultName)
-	if err != nil {
-		return "", nil, err
-	}
-	replaceWithArray := []string{}
-	replaceWithString := ""
-
-	switch pr.ResultType {
-	case "object":
-		if pr.ObjectKey != "" {
-			replaceWithString = result.ObjectVal[pr.ObjectKey]
-		}
-	case "array":
-		if pr.ArrayIdx != nil {
-			replaceWithString = result.ArrayVal[*pr.ArrayIdx]
-		} else {
-			replaceWithArray = append(replaceWithArray, result.ArrayVal...)
-		}
-	// "string"
-	default:
-		replaceWithString = result.StringVal
-	}
-	return replaceWithString, replaceWithArray, nil
-}
-
-// replaceEnv performs replacements for step results in environment variables.
-func replaceEnv(stepDir string) error {
-	for _, e := range os.Environ() {
-		pair := strings.SplitN(e, "=", 2)
-		matches := resultref.StepResultRegex.FindAllStringSubmatch(pair[1], -1)
-		v := pair[1]
-		for _, m := range matches {
-			replaceWith, _, err := findReplacement(stepDir, m[0])
-			if err != nil {
-				return err
-			}
-			v = strings.ReplaceAll(v, m[0], replaceWith)
-		}
-		os.Setenv(pair[0], v)
-	}
-	return nil
-}
-
-// replaceCommandAndArgs performs replacements for step results in e.Command
-func replaceCommandAndArgs(command []string, stepDir string) ([]string, error) {
-	var newCommand []string
-	for _, c := range command {
-		matches := resultref.StepResultRegex.FindAllStringSubmatch(c, -1)
-		newC := []string{c}
-		for _, m := range matches {
-			replaceWithString, replaceWithArray, err := findReplacement(stepDir, m[0])
-			if err != nil {
-				return []string{}, fmt.Errorf("failed to find replacement for %s to replace %s", m[0], c)
-			}
-			// replaceWithString and replaceWithArray are mutually exclusive
-			if len(replaceWithArray) > 0 {
-				if c != m[0] {
-					// it has to be exact in "$(steps.<step-name>.results.<result-name>[*])" format, without anything else in the original string
-					return nil, errors.New("value must be in \"$(steps.<step-name>.results.<result-name>[*])\" format, when using array results")
-				}
-				newC = replaceWithArray
-			} else {
-				newC[0] = strings.ReplaceAll(newC[0], m[0], replaceWithString)
-			}
-		}
-		newCommand = append(newCommand, newC...)
-	}
-	return newCommand, nil
-}
-
-// applyStepResultSubstitutions applies the runtime step result substitutions in env, args and command.
-func (e *Entrypointer) applyStepResultSubstitutions(stepDir string) error {
-	// env
-	if err := replaceEnv(stepDir); err != nil {
-		return err
-	}
-	// command + args
-	newCommand, err := replaceCommandAndArgs(e.Command, stepDir)
-	if err != nil {
-		return err
-	}
-	e.Command = newCommand
-	return nil
 }
 
 // outputRunResult returns the run reason for a termination
@@ -580,22 +477,7 @@ type ArtifactTemplate struct {
 	ArtifactName  string
 }
 
-// applyStepArtifactSubstitutions replaces artifact references within a step's command and environment variables with their corresponding values.
-//
-// This function is designed to handle artifact substitutions in a script file, inline command, or environment variables.
-//
-// Args:
-//
-//	stepDir: The directory of the executing step.
-//
-// Returns:
-//
-//	An error object if any issues occur during substitution.
 func (e *Entrypointer) applyStepArtifactSubstitutions(stepDir string) error {
-	// Script was re-written into a file, we need to read the file to and substitute the content
-	// and re-write the command.
-	// While param substitution cannot be used in Script from StepAction, allowing artifact substitution doesn't seem bad as
-	// artifacts are unmarshalled, should be safe.
 	if len(e.Command) == 1 && filepath.Dir(e.Command[0]) == filepath.Clean(ScriptDir) {
 		dataBytes, err := os.ReadFile(e.Command[0])
 		if err != nil {
