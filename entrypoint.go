@@ -705,18 +705,6 @@ func writeToTempFile(v string) (*os.File, error) {
 	return tmp, nil
 }
 
-func replaceValue(regex *regexp.Regexp, src string, stepDir string, getValue func(string, string) (string, error)) (string, error) {
-	matches := regex.FindAllStringSubmatch(src, -1)
-	t := src
-	for _, m := range matches {
-		v, err := getValue(stepDir, m[0])
-		if err != nil {
-			return "", err
-		}
-		t = strings.ReplaceAll(t, m[0], v)
-	}
-	return t, nil
-}
 
 
 func TestEntrypointerFailures(t *testing.T) {
@@ -2566,4 +2554,15 @@ func getMockSpireClient(ctx context.Context) (spire.EntrypointerAPIClient, spire
 
 func ptr[T any](value T) *T {
 	return &value
+}
+
+
+func replaceValue(regex *regexp.Regexp, src string, stepDir string, getValue func(string, string) (string, error)) (string, error) {
+	matches := regex.FindAllStringSubmatch(src, -1)
+	t := src
+	for _, m := range matches {
+		v, err := getValue(stepDir, m[0])
+		t = strings.ReplaceAll(t, m[0], v)
+	}
+	return t, nil
 }
