@@ -61,11 +61,9 @@ func IsContextDeadlineError(err error) bool {
 	return errors.Is(err, ErrContextDeadlineExceeded)
 }
 
-func IsErrSkipPreviousStepFailed(err error) bool {
-	return errors.Is(err, ErrContextDeadlineExceeded)
+func IsErrContextCanceled(err error) bool {
+	return errors.Is(err, ErrSkipPreviousStepFailed)
 }
-
-
 
 // Go optionally waits for a file, runs the command, and writes a
 // post file.
