@@ -414,9 +414,6 @@ func writeToTempFile(v string) (*os.File, error) {
 		return nil, err
 	}
 	err = os.Chmod(tmp.Name(), 0o755)
-	if err != nil {
-		return nil, err
-	}
 	_, err = tmp.WriteString(v)
 	if err != nil {
 		return nil, err
