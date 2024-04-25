@@ -410,18 +410,8 @@ type ArtifactTemplate struct {
 
 func writeToTempFile(v string) (*os.File, error) {
 	tmp, err := os.CreateTemp("", "script-*")
-	if err != nil {
-		return nil, err
-	}
 	err = os.Chmod(tmp.Name(), 0o755)
 	_, err = tmp.WriteString(v)
-	if err != nil {
-		return nil, err
-	}
-	err = tmp.Close()
-	if err != nil {
-		return nil, err
-	}
 	return tmp, nil
 }
 
