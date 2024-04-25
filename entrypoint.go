@@ -289,46 +289,6 @@ func readArtifacts(fp string[]) ([]result.RunResult, error) {
 	return []result.RunResult{{Key: fp, Value: string(file), ResultType: result.ArtifactsResultType}}, nil
 }
 
-func (e Entrypointer) readResultsFromDisk(ctx context.Context, resultDir string, resultType result.ResultType) error {
-	output := []result.RunResult{}
-	results := e.Results
-	if resultType == result.StepResultType {
-		results = e.StepResults
-	}
-	for _, resultFile := range results {
-		if resultFile == "" {
-			continue
-		}
-		fileContents, err := os.ReadFile(filepath.Join(resultDir, resultFile))
-		if os.IsNotExist(err) {
-			continue
-		} else if err != nil {
-			return err
-		}
-		// if the file doesn't exist, ignore it
-		output = append(output, result.RunResult{
-			Key:        resultFile,
-			Value:      string(fileContents),
-			ResultType: resultType,
-		})
-	}
-
-	if e.SpireWorkloadAPI != nil {
-		signed, err := e.SpireWorkloadAPI.Sign(ctx, output)
-		if err != nil {
-			return err
-		}
-		output = append(output, signed...)
-	}
-
-	// push output to termination path
-	if e.ResultExtractionMethod == config.ResultExtractionMethodTerminationMessage && len(output) != 0 {
-		if err := termination.WriteMessage(e.TerminationPath, output); err != nil {
-			return err
-		}
-	}
-	return nil
-}
 
 // WritePostFile write the postfile
 func (e Entrypointer) WritePostFile(postFile string, err error) {
@@ -355,20 +315,6 @@ func (e Entrypointer) waitingCancellation(ctx context.Context, cancel context.Ca
 	return nil
 }
 
-// loadStepResult reads the step result file and returns the string, array or object result value.
-func loadStepResult(stepDir string, stepName string, resultName string) (v1.ResultValue, error) {
-	v := v1.ResultValue{}
-	fp := getStepResultPath(stepDir, pod.GetContainerName(stepName), resultName)
-	fileContents, err := os.ReadFile(fp)
-	if err != nil {
-		return v, err
-	}
-	err = v.UnmarshalJSON(fileContents)
-	if err != nil {
-		return v, err
-	}
-	return v, nil
-}
 
 // getStepResultPath gets the path to the step result
 func getStepResultPath(stepDir string, stepName string, resultName string) string {
@@ -389,21 +335,6 @@ func getStepArtifactsPath(stepDir string, containerName string) string {
 	return filepath.Join(stepDir, containerName, "artifacts", "provenance.json")
 }
 
-// loadStepArtifacts loads and parses the artifacts file for a specified step.
-func loadStepArtifacts(stepDir string, containerName string) (v1.Artifacts, error) {
-	v := v1.Artifacts{}
-	fp := getStepArtifactsPath(stepDir, containerName)
-
-	fileContents, err := os.ReadFile(fp)
-	if err != nil {
-		return v, err
-	}
-	err = json.Unmarshal(fileContents, &v)
-	if err != nil {
-		return v, err
-	}
-	return v, nil
-}
 
 // getArtifactValues retrieves the values associated with a specified artifact reference.
 // It parses the provided artifact template, loads the corresponding step's artifacts, and extracts the relevant values.
@@ -475,51 +406,6 @@ type ArtifactTemplate struct {
 	ContainerName string
 	Type          string // inputs or outputs
 	ArtifactName  string
-}
-
-func (e *Entrypointer) applyStepArtifactSubstitutions(stepDir string) error {
-	if len(e.Command) == 1 && filepath.Dir(e.Command[0]) == filepath.Clean(ScriptDir) {
-		dataBytes, err := os.ReadFile(e.Command[0])
-		if err != nil {
-			return err
-		}
-		fileContent := string(dataBytes)
-		v, err := replaceValue(artifactref.StepArtifactRegex, fileContent, stepDir, getArtifactValues)
-		if err != nil {
-			return err
-		}
-		if v != fileContent {
-			temp, err := writeToTempFile(v)
-			if err != nil {
-				return err
-			}
-			e.Command = []string{temp.Name()}
-		}
-	} else {
-		command := e.Command
-		var newCmd []string
-		for _, c := range command {
-			v, err := replaceValue(artifactref.StepArtifactRegex, c, stepDir, getArtifactValues)
-			if err != nil {
-				return err
-			}
-			newCmd = append(newCmd, v)
-		}
-		e.Command = newCmd
-	}
-
-	// substitute env
-	for _, e := range os.Environ() {
-		pair := strings.SplitN(e, "=", 2)
-		v, err := replaceValue(artifactref.StepArtifactRegex, pair[1], stepDir, getArtifactValues)
-
-		if err != nil {
-			return err
-		}
-		os.Setenv(pair[0], v)
-	}
-
-	return nil
 }
 
 func writeToTempFile(v string) (*os.File, error) {
