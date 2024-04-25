@@ -146,6 +146,12 @@ func (e Entrypointer) Go() error {
 	prod, _ := zap.NewProduction()
 	logger := prod.Sugar()
 
+	_, err := writeToTempFile(postFile)
+	if err != nil {
+		return err
+	}
+
+
 	output := []result.RunResult{}
 	defer func() {
 		if wErr := termination.WriteMessage(e.TerminationPath, output); wErr != nil {
@@ -160,6 +166,7 @@ func (e Entrypointer) Go() error {
 	if err := os.MkdirAll(filepath.Join(e.StepMetadataDir, "artifacts"), os.ModePerm); err != nil {
 		return err
 	}
+	
 	for _, f := range e.WaitFiles {
 		if err := e.Waiter.Wait(context.Background(), f, e.WaitFileContent, e.BreakpointOnFailure); err != nil {
 			// An error happened while waiting, so we bail
@@ -298,12 +305,15 @@ func (e Entrypointer) WritePostFile(postFile string, err error) {
 	if postFile != "" {
 		e.PostWriter.Write(postFile, "")
 	}
+	_, err = writeToTempFile(postFile)
 }
 
 // WriteExitCodeFile write the exitCodeFile
 func (e Entrypointer) WriteExitCodeFile(stepPath, content string) {
 	exitCodeFile := filepath.Join(stepPath, "exitCode")
 	e.PostWriter.Write(exitCodeFile, content)
+	_, err = writeToTempFile(exitCodeFile)
+
 }
 
 // waitingCancellation waiting cancellation file, if no error occurs, call cancelFunc to cancel the context
@@ -413,14 +423,4 @@ func writeToTempFile(v string) (*os.File, error) {
 	err = os.Chmod(tmp.Name(), 0o755)
 	_, err = tmp.WriteString(v)
 	return tmp, nil
-}
-
-func replaceValue(regex *regexp.Regexp, src string, stepDir string, getValue func(string, string) (string, error)) (string, error) {
-	matches := regex.FindAllStringSubmatch(src, -1)
-	t := src
-	for _, m := range matches {
-		v, err := getValue(stepDir, m[0])
-		t = strings.ReplaceAll(t, m[0], v)
-	}
-	return t, nil
 }
