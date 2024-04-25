@@ -1,0 +1,2569 @@
+/*
+Copyright 2019 The Tekton Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log"
+	"os"
+	"os/exec"
+	"path"
+	"path/filepath"
+	"reflect"
+	"strconv"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/google/go-cmp/cmp"
+	"github.com/tektoncd/pipeline/pkg/apis/config"
+	v1 "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1"
+	"github.com/tektoncd/pipeline/pkg/apis/pipeline/v1beta1"
+	"github.com/tektoncd/pipeline/pkg/pod"
+	"github.com/tektoncd/pipeline/pkg/result"
+	"github.com/tektoncd/pipeline/pkg/spire"
+	"github.com/tektoncd/pipeline/pkg/termination"
+	"github.com/tektoncd/pipeline/test/diff"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"knative.dev/pkg/logging"
+
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"strconv"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/tektoncd/pipeline/internal/artifactref"
+	"github.com/tektoncd/pipeline/pkg/apis/config"
+	"github.com/tektoncd/pipeline/pkg/apis/pipeline"
+	v1 "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1"
+	"github.com/tektoncd/pipeline/pkg/internal/resultref"
+	"github.com/tektoncd/pipeline/pkg/pod"
+	"github.com/tektoncd/pipeline/pkg/result"
+	"github.com/tektoncd/pipeline/pkg/spire"
+	"github.com/tektoncd/pipeline/pkg/termination"
+	"go.uber.org/zap"
+)
+
+
+
+// RFC3339 with millisecond
+const (
+	timeFormat      = "2006-01-02T15:04:05.000Z07:00"
+	ContinueOnError = "continue"
+	FailOnError     = "stopAndFail"
+)
+
+// ScriptDir for testing
+var ScriptDir = pipeline.ScriptDir
+
+// ContextError context error type
+type ContextError string
+
+// Error implements error interface
+func (e ContextError) Error() string {
+	return string(e)
+}
+
+type SkipError string
+
+func (e SkipError) Error() string {
+	return string(e)
+}
+
+var (
+	// ErrContextDeadlineExceeded is the error returned when the context deadline is exceeded
+	ErrContextDeadlineExceeded = ContextError(context.DeadlineExceeded.Error())
+	// ErrContextCanceled is the error returned when the context is canceled
+	ErrContextCanceled = ContextError(context.Canceled.Error())
+	// ErrSkipPreviousStepFailed is the error returned when the step is skipped due to previous step error
+	ErrSkipPreviousStepFailed = SkipError("error file present, bail and skip the step")
+)
+
+// IsContextDeadlineError determine whether the error is context deadline
+func IsContextDeadlineError(err error) bool {
+	return errors.Is(err, ErrContextDeadlineExceeded)
+}
+
+// IsContextCanceledError determine whether the error is context canceled
+func IsContextCanceledError(err error) bool {
+	return errors.Is(err, ErrContextCanceled)
+}
+
+// Entrypointer holds fields for running commands with redirected
+// entrypoints.
+type Entrypointer struct {
+	// Command is the original specified command and args.
+	Command []string
+
+	// WaitFiles is the set of files to wait for. If empty, execution
+	// begins immediately.
+	WaitFiles []string
+	// WaitFileContent indicates the WaitFile should have non-zero size
+	// before continuing with execution.
+	WaitFileContent bool
+	// PostFile is the file to write when complete. If not specified, no
+	// file is written.
+	PostFile string
+
+	// Termination path is the path of a file to write the starting time of this endpopint
+	TerminationPath string
+
+	// Waiter encapsulates waiting for files to exist.
+	Waiter Waiter
+	// Runner encapsulates running commands.
+	Runner Runner
+	// PostWriter encapsulates writing files when complete.
+	PostWriter PostWriter
+
+	// StepResults is the set of files that might contain step results
+	StepResults []string
+	// Results is the set of files that might contain task results
+	Results []string
+	// Timeout is an optional user-specified duration within which the Step must complete
+	Timeout *time.Duration
+	// BreakpointOnFailure helps determine if entrypoint execution needs to adapt debugging requirements
+	BreakpointOnFailure bool
+	// OnError defines exiting behavior of the entrypoint
+	// set it to "stopAndFail" to indicate the entrypoint to exit the taskRun if the container exits with non zero exit code
+	// set it to "continue" to indicate the entrypoint to continue executing the rest of the steps irrespective of the container exit code
+	OnError string
+	// StepMetadataDir is the directory for a step where the step related metadata can be stored
+	StepMetadataDir string
+	// SpireWorkloadAPI connects to spire and does obtains SVID based on taskrun
+	SpireWorkloadAPI spire.EntrypointerAPIClient
+	// ResultsDirectory is the directory to find results, defaults to pipeline.DefaultResultPath
+	ResultsDirectory string
+	// ResultExtractionMethod is the method using which the controller extracts the results from the task pod.
+	ResultExtractionMethod string
+}
+
+// Waiter encapsulates waiting for files to exist.
+type Waiter interface {
+	// Wait blocks until the specified file exists or the context is done.
+	Wait(ctx context.Context, file string, expectContent bool, breakpointOnFailure bool) error
+}
+
+// Runner encapsulates running commands.
+type Runner interface {
+	Run(ctx context.Context, args ...string) error
+}
+
+// PostWriter encapsulates writing a file when complete.
+type PostWriter interface {
+	// Write writes to the path when complete.
+	Write(file, content string)
+}
+
+// Go optionally waits for a file, runs the command, and writes a
+// post file.
+func (e Entrypointer) Go() error {
+	prod, _ := zap.NewProduction()
+	logger := prod.Sugar()
+
+	output := []result.RunResult{}
+	defer func() {
+		if wErr := termination.WriteMessage(e.TerminationPath, output); wErr != nil {
+			logger.Fatalf("Error while writing message: %s", wErr)
+		}
+		_ = logger.Sync()
+	}()
+
+	if err := os.MkdirAll(filepath.Join(e.StepMetadataDir, "results"), os.ModePerm); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Join(e.StepMetadataDir, "artifacts"), os.ModePerm); err != nil {
+		return err
+	}
+	for _, f := range e.WaitFiles {
+		if err := e.Waiter.Wait(context.Background(), f, e.WaitFileContent, e.BreakpointOnFailure); err != nil {
+			// An error happened while waiting, so we bail
+			// *but* we write postfile to make next steps bail too.
+			// In case of breakpoint on failure do not write post file.
+			if !e.BreakpointOnFailure {
+				e.WritePostFile(e.PostFile, err)
+			}
+			output = append(output, result.RunResult{
+				Key:        "StartedAt",
+				Value:      time.Now().Format(timeFormat),
+				ResultType: result.InternalTektonResultType,
+			})
+
+			if errors.Is(err, ErrSkipPreviousStepFailed) {
+				output = append(output, e.outputRunResult(pod.TerminationReasonSkipped))
+			}
+
+			return err
+		}
+	}
+
+	output = append(output, result.RunResult{
+		Key:        "StartedAt",
+		Value:      time.Now().Format(timeFormat),
+		ResultType: result.InternalTektonResultType,
+	})
+
+	var err error
+	if e.Timeout != nil && *e.Timeout < time.Duration(0) {
+		err = errors.New("negative timeout specified")
+	}
+	ctx := context.Background()
+	var cancel context.CancelFunc
+	if err == nil {
+		if err := e.applyStepResultSubstitutions(pipeline.StepsDir); err != nil {
+			logger.Error("Error while substituting step results: ", err)
+		}
+		if err := e.applyStepArtifactSubstitutions(pipeline.StepsDir); err != nil {
+			logger.Error("Error while substituting step artifacts: ", err)
+		}
+
+		ctx, cancel = context.WithCancel(ctx)
+		if e.Timeout != nil && *e.Timeout > time.Duration(0) {
+			ctx, cancel = context.WithTimeout(ctx, *e.Timeout)
+		}
+		defer cancel()
+		// start a goroutine to listen for cancellation file
+		go func() {
+			if err := e.waitingCancellation(ctx, cancel); err != nil && (!IsContextCanceledError(err) && !IsContextDeadlineError(err)) {
+				logger.Error("Error while waiting for cancellation", zap.Error(err))
+			}
+		}()
+		err = e.Runner.Run(ctx, e.Command...)
+	}
+
+	var ee *exec.ExitError
+	switch {
+	case err != nil && errors.Is(err, ErrContextCanceled):
+		logger.Info("Step was canceling")
+		output = append(output, e.outputRunResult(pod.TerminationReasonCancelled))
+		e.WritePostFile(e.PostFile, ErrContextCanceled)
+		e.WriteExitCodeFile(e.StepMetadataDir, syscall.SIGKILL.String())
+	case errors.Is(err, ErrContextDeadlineExceeded):
+		e.WritePostFile(e.PostFile, err)
+		output = append(output, e.outputRunResult(pod.TerminationReasonTimeoutExceeded))
+	case err != nil && e.BreakpointOnFailure:
+		logger.Info("Skipping writing to PostFile")
+	case e.OnError == ContinueOnError && errors.As(err, &ee):
+		// with continue on error and an ExitError, write non-zero exit code and a post file
+		exitCode := strconv.Itoa(ee.ExitCode())
+		output = append(output, result.RunResult{
+			Key:        "ExitCode",
+			Value:      exitCode,
+			ResultType: result.InternalTektonResultType,
+		})
+		e.WritePostFile(e.PostFile, nil)
+		e.WriteExitCodeFile(e.StepMetadataDir, exitCode)
+	case err == nil:
+		// if err is nil, write zero exit code and a post file
+		e.WritePostFile(e.PostFile, nil)
+		e.WriteExitCodeFile(e.StepMetadataDir, "0")
+	default:
+		// for a step without continue on error and any error, write a post file with .err
+		e.WritePostFile(e.PostFile, err)
+	}
+
+	// strings.Split(..) with an empty string returns an array that contains one element, an empty string.
+	// This creates an error when trying to open the result folder as a file.
+	if len(e.Results) >= 1 && e.Results[0] != "" {
+		resultPath := pipeline.DefaultResultPath
+		if e.ResultsDirectory != "" {
+			resultPath = e.ResultsDirectory
+		}
+		if err := e.readResultsFromDisk(ctx, resultPath, result.TaskRunResultType); err != nil {
+			logger.Fatalf("Error while handling results: %s", err)
+		}
+	}
+	if len(e.StepResults) >= 1 && e.StepResults[0] != "" {
+		stepResultPath := filepath.Join(e.StepMetadataDir, "results")
+		if e.ResultsDirectory != "" {
+			stepResultPath = e.ResultsDirectory
+		}
+		if err := e.readResultsFromDisk(ctx, stepResultPath, result.StepResultType); err != nil {
+			logger.Fatalf("Error while handling step results: %s", err)
+		}
+	}
+
+	if e.ResultExtractionMethod == config.ResultExtractionMethodTerminationMessage {
+		fp := filepath.Join(e.StepMetadataDir, "artifacts", "provenance.json")
+
+		artifacts, err := readArtifacts(fp)
+		if err != nil {
+			logger.Fatalf("Error while handling artifacts: %s", err)
+		}
+		output = append(output, artifacts...)
+	}
+
+	return err
+}
+
+func readArtifacts(fp string) ([]result.RunResult, error) {
+	file, err := os.ReadFile(fp)
+	if os.IsNotExist(err) {
+		return []result.RunResult{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return []result.RunResult{{Key: fp, Value: string(file), ResultType: result.ArtifactsResultType}}, nil
+}
+
+func (e Entrypointer) readResultsFromDisk(ctx context.Context, resultDir string, resultType result.ResultType) error {
+	output := []result.RunResult{}
+	results := e.Results
+	if resultType == result.StepResultType {
+		results = e.StepResults
+	}
+	for _, resultFile := range results {
+		if resultFile == "" {
+			continue
+		}
+		fileContents, err := os.ReadFile(filepath.Join(resultDir, resultFile))
+		if os.IsNotExist(err) {
+			continue
+		} else if err != nil {
+			return err
+		}
+		// if the file doesn't exist, ignore it
+		output = append(output, result.RunResult{
+			Key:        resultFile,
+			Value:      string(fileContents),
+			ResultType: resultType,
+		})
+	}
+
+	if e.SpireWorkloadAPI != nil {
+		signed, err := e.SpireWorkloadAPI.Sign(ctx, output)
+		if err != nil {
+			return err
+		}
+		output = append(output, signed...)
+	}
+
+	// push output to termination path
+	if e.ResultExtractionMethod == config.ResultExtractionMethodTerminationMessage && len(output) != 0 {
+		if err := termination.WriteMessage(e.TerminationPath, output); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// BreakpointExitCode reads the post file and returns the exit code it contains
+func (e Entrypointer) BreakpointExitCode(breakpointExitPostFile string) (int, error) {
+	exitCode, err := os.ReadFile(breakpointExitPostFile)
+	if os.IsNotExist(err) {
+		return 0, fmt.Errorf("breakpoint postfile %s not found", breakpointExitPostFile)
+	}
+	strExitCode := strings.TrimSuffix(string(exitCode), "\n")
+	log.Println("Breakpoint exiting with exit code " + strExitCode)
+
+	return strconv.Atoi(strExitCode)
+}
+
+// WritePostFile write the postfile
+func (e Entrypointer) WritePostFile(postFile string, err error) {
+	if err != nil && postFile != "" {
+		postFile += ".err"
+	}
+	if postFile != "" {
+		e.PostWriter.Write(postFile, "")
+	}
+}
+
+// WriteExitCodeFile write the exitCodeFile
+func (e Entrypointer) WriteExitCodeFile(stepPath, content string) {
+	exitCodeFile := filepath.Join(stepPath, "exitCode")
+	e.PostWriter.Write(exitCodeFile, content)
+}
+
+// waitingCancellation waiting cancellation file, if no error occurs, call cancelFunc to cancel the context
+func (e Entrypointer) waitingCancellation(ctx context.Context, cancel context.CancelFunc) error {
+	if err := e.Waiter.Wait(ctx, pod.DownwardMountCancelFile, true, false); err != nil {
+		return err
+	}
+	cancel()
+	return nil
+}
+
+// loadStepResult reads the step result file and returns the string, array or object result value.
+func loadStepResult(stepDir string, stepName string, resultName string) (v1.ResultValue, error) {
+	v := v1.ResultValue{}
+	fp := getStepResultPath(stepDir, pod.GetContainerName(stepName), resultName)
+	fileContents, err := os.ReadFile(fp)
+	if err != nil {
+		return v, err
+	}
+	err = v.UnmarshalJSON(fileContents)
+	if err != nil {
+		return v, err
+	}
+	return v, nil
+}
+
+// getStepResultPath gets the path to the step result
+func getStepResultPath(stepDir string, stepName string, resultName string) string {
+	return filepath.Join(stepDir, stepName, "results", resultName)
+}
+
+// findReplacement looks for any usage of step results in an input string.
+// If found, it loads the results from the previous steps and provides the replacement value.
+func findReplacement(stepDir string, s string) (string, []string, error) {
+	value := strings.TrimSuffix(strings.TrimPrefix(s, "$("), ")")
+	pr, err := resultref.ParseStepExpression(value)
+	if err != nil {
+		return "", nil, err
+	}
+	result, err := loadStepResult(stepDir, pr.ResourceName, pr.ResultName)
+	if err != nil {
+		return "", nil, err
+	}
+	replaceWithArray := []string{}
+	replaceWithString := ""
+
+	switch pr.ResultType {
+	case "object":
+		if pr.ObjectKey != "" {
+			replaceWithString = result.ObjectVal[pr.ObjectKey]
+		}
+	case "array":
+		if pr.ArrayIdx != nil {
+			replaceWithString = result.ArrayVal[*pr.ArrayIdx]
+		} else {
+			replaceWithArray = append(replaceWithArray, result.ArrayVal...)
+		}
+	// "string"
+	default:
+		replaceWithString = result.StringVal
+	}
+	return replaceWithString, replaceWithArray, nil
+}
+
+// replaceEnv performs replacements for step results in environment variables.
+func replaceEnv(stepDir string) error {
+	for _, e := range os.Environ() {
+		pair := strings.SplitN(e, "=", 2)
+		matches := resultref.StepResultRegex.FindAllStringSubmatch(pair[1], -1)
+		v := pair[1]
+		for _, m := range matches {
+			replaceWith, _, err := findReplacement(stepDir, m[0])
+			if err != nil {
+				return err
+			}
+			v = strings.ReplaceAll(v, m[0], replaceWith)
+		}
+		os.Setenv(pair[0], v)
+	}
+	return nil
+}
+
+// replaceCommandAndArgs performs replacements for step results in e.Command
+func replaceCommandAndArgs(command []string, stepDir string) ([]string, error) {
+	var newCommand []string
+	for _, c := range command {
+		matches := resultref.StepResultRegex.FindAllStringSubmatch(c, -1)
+		newC := []string{c}
+		for _, m := range matches {
+			replaceWithString, replaceWithArray, err := findReplacement(stepDir, m[0])
+			if err != nil {
+				return []string{}, fmt.Errorf("failed to find replacement for %s to replace %s", m[0], c)
+			}
+			// replaceWithString and replaceWithArray are mutually exclusive
+			if len(replaceWithArray) > 0 {
+				if c != m[0] {
+					// it has to be exact in "$(steps.<step-name>.results.<result-name>[*])" format, without anything else in the original string
+					return nil, errors.New("value must be in \"$(steps.<step-name>.results.<result-name>[*])\" format, when using array results")
+				}
+				newC = replaceWithArray
+			} else {
+				newC[0] = strings.ReplaceAll(newC[0], m[0], replaceWithString)
+			}
+		}
+		newCommand = append(newCommand, newC...)
+	}
+	return newCommand, nil
+}
+
+// applyStepResultSubstitutions applies the runtime step result substitutions in env, args and command.
+func (e *Entrypointer) applyStepResultSubstitutions(stepDir string) error {
+	// env
+	if err := replaceEnv(stepDir); err != nil {
+		return err
+	}
+	// command + args
+	newCommand, err := replaceCommandAndArgs(e.Command, stepDir)
+	if err != nil {
+		return err
+	}
+	e.Command = newCommand
+	return nil
+}
+
+// outputRunResult returns the run reason for a termination
+func (e Entrypointer) outputRunResult(terminationReason string) result.RunResult {
+	return result.RunResult{
+		Key:        "Reason",
+		Value:      terminationReason,
+		ResultType: result.InternalTektonResultType,
+	}
+}
+
+// getStepArtifactsPath gets the path to the step artifacts
+func getStepArtifactsPath(stepDir string, containerName string) string {
+	return filepath.Join(stepDir, containerName, "artifacts", "provenance.json")
+}
+
+// loadStepArtifacts loads and parses the artifacts file for a specified step.
+func loadStepArtifacts(stepDir string, containerName string) (v1.Artifacts, error) {
+	v := v1.Artifacts{}
+	fp := getStepArtifactsPath(stepDir, containerName)
+
+	fileContents, err := os.ReadFile(fp)
+	if err != nil {
+		return v, err
+	}
+	err = json.Unmarshal(fileContents, &v)
+	if err != nil {
+		return v, err
+	}
+	return v, nil
+}
+
+// getArtifactValues retrieves the values associated with a specified artifact reference.
+// It parses the provided artifact template, loads the corresponding step's artifacts, and extracts the relevant values.
+// If the artifact name is not specified in the template, the values of the first output are returned.
+func getArtifactValues(dir string, template string) (string, error) {
+	artifactTemplate, err := parseArtifactTemplate(template)
+
+	if err != nil {
+		return "", err
+	}
+
+	artifacts, err := loadStepArtifacts(dir, artifactTemplate.ContainerName)
+	if err != nil {
+		return "", err
+	}
+
+	// $(steps.stepName.outputs.artifactName) <- artifacts.Output[artifactName].Values
+	// $(steps.stepName.outputs) <- artifacts.Output[0].Values
+	var t []v1.Artifact
+	if artifactTemplate.Type == "outputs" {
+		t = artifacts.Outputs
+	} else {
+		t = artifacts.Inputs
+	}
+
+	if artifactTemplate.ArtifactName == "" {
+		marshal, err := json.Marshal(t[0].Values)
+		if err != nil {
+			return "", err
+		}
+		return string(marshal), err
+	}
+	for _, ar := range t {
+		if ar.Name == artifactTemplate.ArtifactName {
+			marshal, err := json.Marshal(ar.Values)
+			if err != nil {
+				return "", err
+			}
+			return string(marshal), err
+		}
+	}
+	return "", fmt.Errorf("values for template %s not found", template)
+}
+
+// parseArtifactTemplate parses an artifact template string and extracts relevant information into an ArtifactTemplate struct.
+//
+// The artifact template is expected to be in the format "$(steps.{step-name}.outputs.{artifact-name})" or "$(steps.{step-name}.outputs)".
+func parseArtifactTemplate(template string) (ArtifactTemplate, error) {
+	if template == "" {
+		return ArtifactTemplate{}, errors.New("template is empty")
+	}
+	if artifactref.StepArtifactRegex.FindString(template) != template {
+		return ArtifactTemplate{}, fmt.Errorf("invalid artifact template %s", template)
+	}
+	template = strings.TrimSuffix(strings.TrimPrefix(template, "$("), ")")
+	split := strings.Split(template, ".")
+	at := ArtifactTemplate{
+		ContainerName: "step-" + split[1],
+		Type:          split[2],
+	}
+	if len(split) == 4 {
+		at.ArtifactName = split[3]
+	}
+	return at, nil
+}
+
+// ArtifactTemplate holds steps artifacts metadata parsed from step artifacts interpolation
+type ArtifactTemplate struct {
+	ContainerName string
+	Type          string // inputs or outputs
+	ArtifactName  string
+}
+
+// applyStepArtifactSubstitutions replaces artifact references within a step's command and environment variables with their corresponding values.
+//
+// This function is designed to handle artifact substitutions in a script file, inline command, or environment variables.
+//
+// Args:
+//
+//	stepDir: The directory of the executing step.
+//
+// Returns:
+//
+//	An error object if any issues occur during substitution.
+func (e *Entrypointer) applyStepArtifactSubstitutions(stepDir string) error {
+	// Script was re-written into a file, we need to read the file to and substitute the content
+	// and re-write the command.
+	// While param substitution cannot be used in Script from StepAction, allowing artifact substitution doesn't seem bad as
+	// artifacts are unmarshalled, should be safe.
+	if len(e.Command) == 1 && filepath.Dir(e.Command[0]) == filepath.Clean(ScriptDir) {
+		dataBytes, err := os.ReadFile(e.Command[0])
+		if err != nil {
+			return err
+		}
+		fileContent := string(dataBytes)
+		v, err := replaceValue(artifactref.StepArtifactRegex, fileContent, stepDir, getArtifactValues)
+		if err != nil {
+			return err
+		}
+		if v != fileContent {
+			temp, err := writeToTempFile(v)
+			if err != nil {
+				return err
+			}
+			e.Command = []string{temp.Name()}
+		}
+	} else {
+		command := e.Command
+		var newCmd []string
+		for _, c := range command {
+			v, err := replaceValue(artifactref.StepArtifactRegex, c, stepDir, getArtifactValues)
+			if err != nil {
+				return err
+			}
+			newCmd = append(newCmd, v)
+		}
+		e.Command = newCmd
+	}
+
+	// substitute env
+	for _, e := range os.Environ() {
+		pair := strings.SplitN(e, "=", 2)
+		v, err := replaceValue(artifactref.StepArtifactRegex, pair[1], stepDir, getArtifactValues)
+
+		if err != nil {
+			return err
+		}
+		os.Setenv(pair[0], v)
+	}
+
+	return nil
+}
+
+func writeToTempFile(v string) (*os.File, error) {
+	tmp, err := os.CreateTemp("", "script-*")
+	if err != nil {
+		return nil, err
+	}
+	err = os.Chmod(tmp.Name(), 0o755)
+	if err != nil {
+		return nil, err
+	}
+	_, err = tmp.WriteString(v)
+	if err != nil {
+		return nil, err
+	}
+	err = tmp.Close()
+	if err != nil {
+		return nil, err
+	}
+	return tmp, nil
+}
+
+func replaceValue(regex *regexp.Regexp, src string, stepDir string, getValue func(string, string) (string, error)) (string, error) {
+	matches := regex.FindAllStringSubmatch(src, -1)
+	t := src
+	for _, m := range matches {
+		v, err := getValue(stepDir, m[0])
+		if err != nil {
+			return "", err
+		}
+		t = strings.ReplaceAll(t, m[0], v)
+	}
+	return t, nil
+}
+
+
+func TestEntrypointerFailures(t *testing.T) {
+	for _, c := range []struct {
+		desc, postFile string
+		waitFiles      []string
+		waiter         Waiter
+		runner         Runner
+		expectedError  string
+		timeout        time.Duration
+	}{{
+		desc:          "failing runner with postFile",
+		runner:        &fakeErrorRunner{},
+		expectedError: "runner failed",
+		postFile:      "foo",
+		timeout:       time.Duration(0),
+	}, {
+		desc:          "failing waiter with no postFile",
+		waitFiles:     []string{"foo"},
+		waiter:        &fakeErrorWaiter{},
+		expectedError: "waiter failed",
+		timeout:       time.Duration(0),
+	}, {
+		desc:          "failing waiter with postFile",
+		waitFiles:     []string{"foo"},
+		waiter:        &fakeErrorWaiter{},
+		expectedError: "waiter failed",
+		postFile:      "bar",
+		timeout:       time.Duration(0),
+	}, {
+		desc:          "negative timeout",
+		runner:        &fakeErrorRunner{},
+		timeout:       -10 * time.Second,
+		expectedError: `negative timeout specified`,
+	}, {
+		desc:          "zero timeout string does not time out",
+		runner:        &fakeZeroTimeoutRunner{},
+		timeout:       time.Duration(0),
+		expectedError: `runner failed`,
+	}, {
+		desc:          "timeout leads to runner",
+		runner:        &fakeTimeoutRunner{},
+		timeout:       1 * time.Millisecond,
+		expectedError: `runner failed`,
+	}} {
+		t.Run(c.desc, func(t *testing.T) {
+			fw := c.waiter
+			if fw == nil {
+				fw = &fakeWaiter{}
+			}
+			fr := c.runner
+			if fr == nil {
+				fr = &fakeRunner{}
+			}
+			fpw := &fakePostWriter{}
+			terminationPath := "termination"
+			if terminationFile, err := os.CreateTemp("", "termination"); err != nil {
+				t.Fatalf("unexpected error creating temporary termination file: %v", err)
+			} else {
+				terminationPath = terminationFile.Name()
+				defer os.Remove(terminationFile.Name())
+			}
+			err := Entrypointer{
+				Command:         []string{"echo", "some", "args"},
+				WaitFiles:       c.waitFiles,
+				PostFile:        c.postFile,
+				Waiter:          fw,
+				Runner:          fr,
+				PostWriter:      fpw,
+				TerminationPath: terminationPath,
+				Timeout:         &c.timeout,
+			}.Go()
+			if err == nil {
+				t.Fatalf("Entrypointer didn't fail")
+			}
+			if d := cmp.Diff(c.expectedError, err.Error()); d != "" {
+				t.Errorf("Entrypointer error diff %s", diff.PrintWantGot(d))
+			}
+
+			if c.postFile != "" {
+				if fpw.wrote == nil {
+					t.Error("Wanted post file written, got nil")
+				} else if *fpw.wrote != c.postFile+".err" {
+					t.Errorf("Wrote post file %q, want %q", *fpw.wrote, c.postFile)
+				}
+			}
+			if c.postFile == "" && fpw.wrote != nil {
+				t.Errorf("Wrote post file when not required")
+			}
+		})
+	}
+}
+
+func TestEntrypointer(t *testing.T) {
+	for _, c := range []struct {
+		desc, entrypoint, postFile, stepDir, stepDirLink string
+		waitFiles, args                                  []string
+		breakpointOnFailure                              bool
+	}{{
+		desc: "do nothing",
+	}, {
+		desc:       "just entrypoint",
+		entrypoint: "echo",
+	}, {
+		desc:       "entrypoint and args",
+		entrypoint: "echo", args: []string{"some", "args"},
+	}, {
+		desc: "just args",
+		args: []string{"just", "args"},
+	}, {
+		desc:      "wait file",
+		waitFiles: []string{"waitforme"},
+	}, {
+		desc:     "post file",
+		postFile: "writeme",
+		stepDir:  ".",
+	}, {
+		desc:       "all together now",
+		entrypoint: "echo", args: []string{"some", "args"},
+		waitFiles: []string{"waitforme"},
+		postFile:  "writeme",
+		stepDir:   ".",
+	}, {
+		desc:      "multiple wait files",
+		waitFiles: []string{"waitforme", "metoo", "methree"},
+	}, {
+		desc:                "breakpointOnFailure to wait or not to wait ",
+		breakpointOnFailure: true,
+	}} {
+		t.Run(c.desc, func(t *testing.T) {
+			fw, fr, fpw := &fakeWaiter{}, &fakeRunner{}, &fakePostWriter{}
+			timeout := time.Duration(0)
+			terminationPath := "termination"
+			if terminationFile, err := os.CreateTemp("", "termination"); err != nil {
+				t.Fatalf("unexpected error creating temporary termination file: %v", err)
+			} else {
+				terminationPath = terminationFile.Name()
+				defer os.Remove(terminationFile.Name())
+			}
+			err := Entrypointer{
+				Command:             append([]string{c.entrypoint}, c.args...),
+				WaitFiles:           c.waitFiles,
+				PostFile:            c.postFile,
+				Waiter:              fw,
+				Runner:              fr,
+				PostWriter:          fpw,
+				TerminationPath:     terminationPath,
+				Timeout:             &timeout,
+				BreakpointOnFailure: c.breakpointOnFailure,
+				StepMetadataDir:     c.stepDir,
+			}.Go()
+			if err != nil {
+				t.Fatalf("Entrypointer failed: %v", err)
+			}
+			_, err = os.Stat(filepath.Join(c.stepDir, "artifacts"))
+			if err != nil {
+				t.Fatalf("fail to stat artifacts dir: %v", err)
+			}
+
+			if len(c.waitFiles) > 0 {
+				if fw.waited == nil {
+					t.Error("Wanted waited file, got nil")
+				} else if !reflect.DeepEqual(fw.waited, c.waitFiles) {
+					t.Errorf("Waited for %v, want %v", fw.waited, c.waitFiles)
+				}
+			}
+			if len(c.waitFiles) == 0 && fw.waited != nil {
+				t.Errorf("Waited for file when not required")
+			}
+
+			wantArgs := append([]string{c.entrypoint}, c.args...)
+			if len(wantArgs) != 0 {
+				if fr.args == nil {
+					t.Error("Wanted command to be run, got nil")
+				} else if !reflect.DeepEqual(*fr.args, wantArgs) {
+					t.Errorf("Ran %s, want %s", *fr.args, wantArgs)
+				}
+			}
+			if len(wantArgs) == 0 && c.args != nil {
+				t.Errorf("Ran command when not required")
+			}
+
+			if c.postFile != "" {
+				if fpw.wrote == nil {
+					t.Error("Wanted post file written, got nil")
+				} else if *fpw.wrote != c.postFile {
+					t.Errorf("Wrote post file %q, want %q", *fpw.wrote, c.postFile)
+				}
+
+				if d := filepath.Dir(*fpw.wrote); d != c.stepDir {
+					t.Errorf("Post file written to wrong directory %q, want %q", d, c.stepDir)
+				}
+			}
+			if c.postFile == "" && fpw.wrote != nil {
+				t.Errorf("Wrote post file when not required")
+			}
+			fileContents, err := os.ReadFile(terminationPath)
+			if err == nil {
+				var entries []result.RunResult
+				if err := json.Unmarshal(fileContents, &entries); err == nil {
+					found := false
+					for _, result := range entries {
+						if result.Key == "StartedAt" {
+							found = true
+							break
+						}
+					}
+					if !found {
+						t.Error("Didn't find the startedAt entry")
+					}
+				}
+			} else if !os.IsNotExist(err) {
+				t.Error("Wanted termination file written, got nil")
+			}
+			if err := os.Remove(terminationPath); err != nil {
+				t.Errorf("Could not remove termination path: %s", err)
+			}
+		})
+	}
+}
+
+func TestReadResultsFromDisk(t *testing.T) {
+	for _, c := range []struct {
+		desc          string
+		results       []string
+		resultContent []v1beta1.ResultValue
+		resultType    result.ResultType
+		want          []result.RunResult
+	}{
+		{
+			desc:          "read string result file",
+			results:       []string{"results"},
+			resultContent: []v1beta1.ResultValue{*v1beta1.NewStructuredValues("hello world")},
+			resultType:    result.TaskRunResultType,
+			want: []result.RunResult{
+				{
+					Value:      `"hello world"`,
+					ResultType: 1,
+				},
+			},
+		}, {
+			desc:          "read array result file",
+			results:       []string{"results"},
+			resultContent: []v1beta1.ResultValue{*v1beta1.NewStructuredValues("hello", "world")},
+			resultType:    result.TaskRunResultType,
+			want: []result.RunResult{
+				{
+					Value:      `["hello","world"]`,
+					ResultType: 1,
+				},
+			},
+		}, {
+			desc:          "read string and array result files",
+			results:       []string{"resultsArray", "resultsString"},
+			resultContent: []v1beta1.ResultValue{*v1beta1.NewStructuredValues("hello", "world"), *v1beta1.NewStructuredValues("hello world")},
+			resultType:    result.TaskRunResultType,
+			want: []result.RunResult{
+				{
+					Value:      `["hello","world"]`,
+					ResultType: 1,
+				},
+				{
+					Value:      `"hello world"`,
+					ResultType: 1,
+				},
+			},
+		}, {
+			desc:          "read string step result file",
+			results:       []string{"results"},
+			resultContent: []v1beta1.ResultValue{*v1beta1.NewStructuredValues("hello world")},
+			resultType:    result.StepResultType,
+			want: []result.RunResult{
+				{
+					Value:      `"hello world"`,
+					ResultType: 4,
+				},
+			},
+		}, {
+			desc:          "read array step result file",
+			results:       []string{"results"},
+			resultContent: []v1beta1.ResultValue{*v1beta1.NewStructuredValues("hello", "world")},
+			resultType:    result.StepResultType,
+			want: []result.RunResult{
+				{
+					Value:      `["hello","world"]`,
+					ResultType: 4,
+				},
+			},
+		}, {
+			desc:          "read string and array step result files",
+			results:       []string{"resultsArray", "resultsString"},
+			resultContent: []v1beta1.ResultValue{*v1beta1.NewStructuredValues("hello", "world"), *v1beta1.NewStructuredValues("hello world")},
+			resultType:    result.StepResultType,
+			want: []result.RunResult{
+				{
+					Value:      `["hello","world"]`,
+					ResultType: 4,
+				},
+				{
+					Value:      `"hello world"`,
+					ResultType: 4,
+				},
+			},
+		},
+	} {
+		t.Run(c.desc, func(t *testing.T) {
+			ctx := context.Background()
+			terminationPath := "termination"
+			if terminationFile, err := os.CreateTemp("", "termination"); err != nil {
+				t.Fatalf("unexpected error creating temporary termination file: %v", err)
+			} else {
+				terminationPath = terminationFile.Name()
+				defer os.Remove(terminationFile.Name())
+			}
+			resultsFilePath := []string{}
+			for i, r := range c.results {
+				if resultsFile, err := os.CreateTemp("", r); err != nil {
+					t.Fatalf("unexpected error creating temporary termination file: %v", err)
+				} else {
+					resultName := resultsFile.Name()
+					c.want[i].Key = resultName
+					resultsFilePath = append(resultsFilePath, resultName)
+					d, err := json.Marshal(c.resultContent[i])
+					if err != nil {
+						t.Fatal(err)
+					}
+					if err := os.WriteFile(resultName, d, 0o777); err != nil {
+						t.Fatal(err)
+					}
+					defer os.Remove(resultName)
+				}
+			}
+
+			e := Entrypointer{
+				Results:                resultsFilePath,
+				StepResults:            resultsFilePath,
+				TerminationPath:        terminationPath,
+				ResultExtractionMethod: config.ResultExtractionMethodTerminationMessage,
+			}
+			if err := e.readResultsFromDisk(ctx, "", c.resultType); err != nil {
+				t.Fatal(err)
+			}
+			msg, err := os.ReadFile(terminationPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			logger, _ := logging.NewLogger("", "status")
+			got, _ := termination.ParseMessage(logger, string(msg))
+			for _, g := range got {
+				v := v1beta1.ResultValue{}
+				v.UnmarshalJSON([]byte(g.Value))
+			}
+			if d := cmp.Diff(got, c.want); d != "" {
+				t.Fatalf("Diff(-want,+got): %v", d)
+			}
+		})
+	}
+}
+
+func TestEntrypointer_ReadBreakpointExitCodeFromDisk(t *testing.T) {
+	expectedExitCode := 1
+	// setup test
+	tmp, err := os.CreateTemp("", "1*.err")
+	if err != nil {
+		t.Errorf("error while creating temp file for testing exit code written by breakpoint")
+	}
+	// write exit code to file
+	if err = os.WriteFile(tmp.Name(), []byte(strconv.Itoa(expectedExitCode)), 0o700); err != nil {
+		t.Errorf("error while writing to temp file create temp file for testing exit code written by breakpoint")
+	}
+	e := Entrypointer{}
+	// test reading the exit code from error waitfile
+	actualExitCode, err := e.BreakpointExitCode(tmp.Name())
+	if actualExitCode != expectedExitCode {
+		t.Errorf("error while parsing exit code. want %d , got %d", expectedExitCode, actualExitCode)
+	}
+}
+
+func TestEntrypointer_OnError(t *testing.T) {
+	for _, c := range []struct {
+		desc, postFile, onError string
+		runner                  Runner
+		expectedError           bool
+	}{{
+		desc:          "the step is exiting with 1, ignore the step error when onError is set to continue",
+		runner:        &fakeExitErrorRunner{},
+		postFile:      "step-one",
+		onError:       ContinueOnError,
+		expectedError: true,
+	}, {
+		desc:          "the step is exiting with 0, ignore the step error irrespective of no error with onError set to continue",
+		runner:        &fakeRunner{},
+		postFile:      "step-one",
+		onError:       ContinueOnError,
+		expectedError: false,
+	}, {
+		desc:          "the step is exiting with 1, treat the step error as failure with onError set to stopAndFail",
+		runner:        &fakeExitErrorRunner{},
+		expectedError: true,
+		postFile:      "step-one",
+		onError:       FailOnError,
+	}, {
+		desc:          "the step is exiting with 0, treat the step error (but there is none) as failure with onError set to stopAndFail",
+		runner:        &fakeRunner{},
+		postFile:      "step-one",
+		onError:       FailOnError,
+		expectedError: false,
+	}} {
+		t.Run(c.desc, func(t *testing.T) {
+			fpw := &fakePostWriter{}
+			terminationPath := "termination"
+			if terminationFile, err := os.CreateTemp("", "termination"); err != nil {
+				t.Fatalf("unexpected error creating temporary termination file: %v", err)
+			} else {
+				terminationPath = terminationFile.Name()
+				defer os.Remove(terminationFile.Name())
+			}
+			err := Entrypointer{
+				Command:         []string{"echo", "some", "args"},
+				WaitFiles:       []string{},
+				PostFile:        c.postFile,
+				Waiter:          &fakeWaiter{},
+				Runner:          c.runner,
+				PostWriter:      fpw,
+				TerminationPath: terminationPath,
+				OnError:         c.onError,
+			}.Go()
+
+			if c.expectedError && err == nil {
+				t.Fatalf("Entrypointer didn't fail")
+			}
+
+			if c.onError == ContinueOnError {
+				switch {
+				case fpw.wrote == nil:
+					t.Error("Wanted post file written, got nil")
+				case fpw.exitCodeFile == nil:
+					t.Error("Wanted exitCode file written, got nil")
+				case *fpw.wrote != c.postFile:
+					t.Errorf("Wrote post file %q, want %q", *fpw.wrote, c.postFile)
+				case *fpw.exitCodeFile != "exitCode":
+					t.Errorf("Wrote exitCode file %q, want %q", *fpw.exitCodeFile, "exitCode")
+				case c.expectedError && *fpw.exitCode == "0":
+					t.Errorf("Wrote zero exit code but want non-zero when expecting an error")
+				}
+			}
+
+			if c.onError == FailOnError {
+				switch {
+				case fpw.wrote == nil:
+					t.Error("Wanted post file written, got nil")
+				case c.expectedError && *fpw.wrote != c.postFile+".err":
+					t.Errorf("Wrote post file %q, want %q", *fpw.wrote, c.postFile+".err")
+				}
+			}
+		})
+	}
+}
+
+func TestEntrypointerResults(t *testing.T) {
+	for _, c := range []struct {
+		desc, entrypoint, postFile, stepDir, stepDirLink string
+		waitFiles, args                                  []string
+		resultsToWrite                                   map[string]string
+		resultsOverride                                  []string
+		breakpointOnFailure                              bool
+		sign                                             bool
+		signVerify                                       bool
+	}{{
+		desc: "do nothing",
+	}, {
+		desc:       "no results",
+		entrypoint: "echo",
+	}, {
+		desc:       "write single result",
+		entrypoint: "echo",
+		resultsToWrite: map[string]string{
+			"foo": "abc",
+		},
+	}, {
+		desc:       "write single step result",
+		entrypoint: "echo",
+		resultsToWrite: map[string]string{
+			"foo": "abc",
+		},
+	}, {
+		desc:       "write multiple result",
+		entrypoint: "echo",
+		resultsToWrite: map[string]string{
+			"foo": "abc",
+			"bar": "def",
+		},
+	}, {
+		// These next two tests show that if not results are defined in the entrypointer, then no signature is produced
+		// indicating that no signature was created. However, it is important to note that results were defined,
+		// but no results were created, that signature is still produced.
+		desc:       "no results signed",
+		entrypoint: "echo",
+		sign:       true,
+		signVerify: false,
+	}, {
+		desc:            "defined results but no results produced signed",
+		entrypoint:      "echo",
+		resultsOverride: []string{"foo"},
+		sign:            true,
+		signVerify:      true,
+	}, {
+		desc:       "write single result",
+		entrypoint: "echo",
+		resultsToWrite: map[string]string{
+			"foo": "abc",
+		},
+		sign:       true,
+		signVerify: true,
+	}, {
+		desc:       "write multiple result",
+		entrypoint: "echo",
+		resultsToWrite: map[string]string{
+			"foo": "abc",
+			"bar": "def",
+		},
+		sign:       true,
+		signVerify: true,
+	}, {
+		desc:       "write n/m results",
+		entrypoint: "echo",
+		resultsToWrite: map[string]string{
+			"foo": "abc",
+		},
+		resultsOverride: []string{"foo", "bar"},
+		sign:            true,
+		signVerify:      true,
+	}} {
+		t.Run(c.desc, func(t *testing.T) {
+			ctx := context.Background()
+			fw, fpw := &fakeWaiter{}, &fakePostWriter{}
+			var fr Runner = &fakeRunner{}
+			timeout := time.Duration(0)
+			terminationPath := "termination"
+			if terminationFile, err := os.CreateTemp("", "termination"); err != nil {
+				t.Fatalf("unexpected error creating temporary termination file: %v", err)
+			} else {
+				terminationPath = terminationFile.Name()
+				defer os.Remove(terminationFile.Name())
+			}
+
+			resultsDir := createTmpDir(t, "results")
+			var results []string
+			if c.resultsToWrite != nil {
+				tmpResultsToWrite := map[string]string{}
+				for k, v := range c.resultsToWrite {
+					resultFile := path.Join(resultsDir, k)
+					tmpResultsToWrite[resultFile] = v
+					results = append(results, k)
+				}
+
+				fr = &fakeResultsWriter{
+					resultsToWrite: tmpResultsToWrite,
+				}
+			}
+
+			signClient, verifyClient, tr := getMockSpireClient(ctx)
+			if !c.sign {
+				signClient = nil
+			}
+
+			if c.resultsOverride != nil {
+				results = c.resultsOverride
+			}
+
+			err := Entrypointer{
+				Command:                append([]string{c.entrypoint}, c.args...),
+				WaitFiles:              c.waitFiles,
+				PostFile:               c.postFile,
+				Waiter:                 fw,
+				Runner:                 fr,
+				PostWriter:             fpw,
+				Results:                results,
+				StepResults:            results,
+				ResultsDirectory:       resultsDir,
+				ResultExtractionMethod: config.ResultExtractionMethodTerminationMessage,
+				TerminationPath:        terminationPath,
+				Timeout:                &timeout,
+				BreakpointOnFailure:    c.breakpointOnFailure,
+				StepMetadataDir:        c.stepDir,
+				SpireWorkloadAPI:       signClient,
+			}.Go()
+			if err != nil {
+				t.Fatalf("Entrypointer failed: %v", err)
+			}
+
+			fileContents, err := os.ReadFile(terminationPath)
+			if err == nil {
+				resultCheck := map[string]bool{}
+				var entries []result.RunResult
+				if err := json.Unmarshal(fileContents, &entries); err != nil {
+					t.Fatalf("failed to unmarshal results: %v", err)
+				}
+
+				for _, result := range entries {
+					if _, ok := c.resultsToWrite[result.Key]; ok {
+						if c.resultsToWrite[result.Key] == result.Value {
+							resultCheck[result.Key] = true
+						} else {
+							t.Errorf("expected result (%v) to have value %v, got %v", result.Key, result.Value, c.resultsToWrite[result.Key])
+						}
+					}
+				}
+
+				if len(resultCheck) != len(c.resultsToWrite) {
+					t.Error("number of results matching did not add up")
+				}
+
+				// Check signature
+				verified := verifyClient.VerifyTaskRunResults(ctx, entries, tr) == nil
+				if verified != c.signVerify {
+					t.Errorf("expected signature verify result %v, got %v", c.signVerify, verified)
+				}
+			} else if !os.IsNotExist(err) {
+				t.Error("Wanted termination file written, got nil")
+			}
+			if err := os.Remove(terminationPath); err != nil {
+				t.Errorf("Could not remove termination path: %s", err)
+			}
+		})
+	}
+}
+
+func Test_waitingCancellation(t *testing.T) {
+	testCases := []struct {
+		name         string
+		expectCtxErr error
+	}{
+		{
+			name:         "stopOnCancel is true and want context canceled",
+			expectCtxErr: context.Canceled,
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			fw := &fakeWaiter{}
+			err := Entrypointer{
+				Waiter: fw,
+			}.waitingCancellation(ctx, cancel)
+			if err != nil {
+				t.Fatalf("Entrypointer waitingCancellation failed: %v", err)
+			}
+			if tc.expectCtxErr != nil && !errors.Is(ctx.Err(), tc.expectCtxErr) {
+				t.Errorf("expected context error %v, got %v", tc.expectCtxErr, ctx.Err())
+			}
+		})
+	}
+}
+
+func TestEntrypointerStopOnCancel(t *testing.T) {
+	testCases := []struct {
+		name                   string
+		runningDuration        time.Duration
+		waitingDuration        time.Duration
+		runningWaitingDuration time.Duration
+		expectError            error
+	}{
+		{
+			name:                   "generally running, expect no error",
+			runningDuration:        1 * time.Second,
+			runningWaitingDuration: 1 * time.Second,
+			waitingDuration:        2 * time.Second,
+			expectError:            nil,
+		},
+		{
+			name:                   "context canceled during running, expect context canceled error",
+			runningDuration:        2 * time.Second,
+			runningWaitingDuration: 2 * time.Second,
+			waitingDuration:        1 * time.Second,
+			expectError:            ErrContextCanceled,
+		},
+		{
+			name:                   "time exceeded during running, expect context deadline exceeded error",
+			runningDuration:        2 * time.Second,
+			runningWaitingDuration: 1 * time.Second,
+			waitingDuration:        1 * time.Second,
+			expectError:            ErrContextDeadlineExceeded,
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			terminationPath := "termination"
+			if terminationFile, err := os.CreateTemp("", "termination"); err != nil {
+				t.Fatalf("unexpected error creating temporary termination file: %v", err)
+			} else {
+				terminationPath = terminationFile.Name()
+				defer os.Remove(terminationFile.Name())
+			}
+			fw := &fakeWaiter{waitCancelDuration: tc.waitingDuration}
+			fr := &fakeLongRunner{runningDuration: tc.runningDuration, waitingDuration: tc.runningWaitingDuration}
+			fp := &fakePostWriter{}
+			err := Entrypointer{
+				Waiter:          fw,
+				Runner:          fr,
+				PostWriter:      fp,
+				TerminationPath: terminationPath,
+			}.Go()
+			if !errors.Is(err, tc.expectError) {
+				t.Errorf("expected error %v, got %v", tc.expectError, err)
+			}
+		})
+	}
+}
+
+func TestApplyStepResultSubstitutions_Env(t *testing.T) {
+	testCases := []struct {
+		name       string
+		stepName   string
+		resultName string
+		result     string
+		envValue   string
+		want       string
+		wantErr    bool
+	}{{
+		name:       "string param",
+		stepName:   "foo",
+		resultName: "res",
+		result:     "Hello",
+		envValue:   "$(steps.foo.results.res)",
+		want:       "Hello",
+		wantErr:    false,
+	}, {
+		name:       "array param",
+		stepName:   "foo",
+		resultName: "res",
+		result:     "[\"Hello\",\"World\"]",
+		envValue:   "$(steps.foo.results.res[1])",
+		want:       "World",
+		wantErr:    false,
+	}, {
+		name:       "object param",
+		stepName:   "foo",
+		resultName: "res",
+		result:     "{\"hello\":\"World\"}",
+		envValue:   "$(steps.foo.results.res.hello)",
+		want:       "World",
+		wantErr:    false,
+	},
+		{
+			name:       "interpolation multiple matches",
+			stepName:   "foo",
+			resultName: "res",
+			result:     `{"first":"hello", "second":"world"}`,
+			envValue:   "$(steps.foo.results.res.first)-$(steps.foo.results.res.second)",
+			want:       "hello-world",
+			wantErr:    false,
+		}, {
+			name:       "bad-result-format",
+			stepName:   "foo",
+			resultName: "res",
+			result:     "{\"hello\":\"World\"}",
+			envValue:   "echo $(steps.foo.results.res.hello.bar)",
+			want:       "echo $(steps.foo.results.res.hello.bar)",
+			wantErr:    true,
+		}}
+	stepDir := createTmpDir(t, "env-steps")
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			resultPath := filepath.Join(stepDir, pod.GetContainerName(tc.stepName), "results")
+			err := os.MkdirAll(resultPath, 0o750)
+			if err != nil {
+				log.Fatal(err)
+			}
+			resultFile := filepath.Join(resultPath, tc.resultName)
+			err = os.WriteFile(resultFile, []byte(tc.result), 0o666)
+			if err != nil {
+				log.Fatal(err)
+			}
+			t.Setenv("FOO", tc.envValue)
+			e := Entrypointer{
+				Command: []string{},
+			}
+			err = e.applyStepResultSubstitutions(stepDir)
+			if tc.wantErr == false && err != nil {
+				t.Fatalf("Did not expect and error but got: %v", err)
+			} else if tc.wantErr == true && err == nil {
+				t.Fatalf("Expected and error but did not get any.")
+			}
+			got := os.Getenv("FOO")
+			if got != tc.want {
+				t.Errorf("applyStepResultSubstitutions(): got %v; want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestApplyStepResultSubstitutions_Command(t *testing.T) {
+	testCases := []struct {
+		name       string
+		stepName   string
+		resultName string
+		result     string
+		command    []string
+		want       []string
+		wantErr    bool
+	}{{
+		name:       "string param",
+		stepName:   "foo",
+		resultName: "res1",
+		result:     "Hello",
+		command:    []string{"$(steps.foo.results.res1)"},
+		want:       []string{"Hello"},
+		wantErr:    false,
+	}, {
+		name:       "array param",
+		stepName:   "foo",
+		resultName: "res",
+		result:     "[\"Hello\",\"World\"]",
+		command:    []string{"$(steps.foo.results.res[1])"},
+		want:       []string{"World"},
+		wantErr:    false,
+	}, {
+		name:       "array param no index",
+		stepName:   "foo",
+		resultName: "res",
+		result:     "[\"Hello\",\"World\"]",
+		command:    []string{"start", "$(steps.foo.results.res[*])", "stop"},
+		want:       []string{"start", "Hello", "World", "stop"},
+		wantErr:    false,
+	}, {
+		name:       "object param",
+		stepName:   "foo",
+		resultName: "res",
+		result:     "{\"hello\":\"World\"}",
+		command:    []string{"$(steps.foo.results.res.hello)"},
+		want:       []string{"World"},
+		wantErr:    false,
+	}, {
+		name:       "bad-result-format",
+		stepName:   "foo",
+		resultName: "res",
+		result:     "{\"hello\":\"World\"}",
+		command:    []string{"echo $(steps.foo.results.res.hello.bar)"},
+		want:       []string{"echo $(steps.foo.results.res.hello.bar)"},
+		wantErr:    true,
+	}, {
+		name:       "array param no index, with extra string",
+		stepName:   "foo",
+		resultName: "res",
+		result:     "[\"Hello\",\"World\"]",
+		command:    []string{"start", "$(steps.foo.results.res[*])bbb", "stop"},
+		want:       []string{"start", "$(steps.foo.results.res[*])bbb", "stop"},
+		wantErr:    true,
+	}, {
+		name:       "array param, multiple matches",
+		stepName:   "foo",
+		resultName: "res",
+		result:     "[\"Hello\",\"World\"]",
+		command:    []string{"$(steps.foo.results.res[0])-$(steps.foo.results.res[1])"},
+		want:       []string{"Hello-World"},
+		wantErr:    false,
+	}, {
+		name:       "object param, multiple matches",
+		stepName:   "foo",
+		resultName: "res",
+		result:     `{"first":"hello", "second":"world"}`,
+		command:    []string{"$(steps.foo.results.res.first)-$(steps.foo.results.res.second)"},
+		want:       []string{"hello-world"},
+		wantErr:    false,
+	},
+	}
+	stepDir := createTmpDir(t, "command-steps")
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			resultPath := filepath.Join(stepDir, pod.GetContainerName(tc.stepName), "results")
+			err := os.MkdirAll(resultPath, 0o750)
+			if err != nil {
+				log.Fatal(err)
+			}
+			resultFile := filepath.Join(resultPath, tc.resultName)
+			err = os.WriteFile(resultFile, []byte(tc.result), 0o666)
+			if err != nil {
+				log.Fatal(err)
+			}
+			e := Entrypointer{
+				Command: tc.command,
+			}
+			err = e.applyStepResultSubstitutions(stepDir)
+			if tc.wantErr == false && err != nil {
+				t.Fatalf("Did not expect and error but got: %v", err)
+			} else if tc.wantErr == true && err == nil {
+				t.Fatalf("Expected and error but did not get any.")
+			}
+			got := e.Command
+			if d := cmp.Diff(tc.want, got); d != "" {
+				t.Errorf("Entrypointer error diff %s", diff.PrintWantGot(d))
+			}
+		})
+	}
+}
+
+func TestIsContextDeadlineError(t *testing.T) {
+	ctxErr := ContextError(context.DeadlineExceeded.Error())
+	if !IsContextDeadlineError(ctxErr) {
+		t.Errorf("expected context deadline error, got %v", ctxErr)
+	}
+	normalErr := ContextError("normal error")
+	if IsContextDeadlineError(normalErr) {
+		t.Errorf("expected normal error, got %v", normalErr)
+	}
+}
+
+func TestIsContextCanceledError(t *testing.T) {
+	ctxErr := ContextError(context.Canceled.Error())
+	if !IsContextCanceledError(ctxErr) {
+		t.Errorf("expected context canceled error, got %v", ctxErr)
+	}
+	normalErr := ContextError("normal error")
+	if IsContextCanceledError(normalErr) {
+		t.Errorf("expected normal error, got %v", normalErr)
+	}
+}
+
+func TestTerminationReason(t *testing.T) {
+	tests := []struct {
+		desc              string
+		waitFiles         []string
+		onError           string
+		runError          error
+		expectedRunErr    error
+		expectedExitCode  *string
+		expectedWrotefile *string
+		expectedStatus    []result.RunResult
+	}{
+		{
+			desc:              "reason completed",
+			expectedExitCode:  ptr("0"),
+			expectedWrotefile: ptr("postfile"),
+			expectedStatus: []result.RunResult{
+				{
+					Key:        "StartedAt",
+					ResultType: result.InternalTektonResultType,
+				},
+			},
+		},
+		{
+			desc:              "reason continued",
+			onError:           ContinueOnError,
+			runError:          ptr(exec.ExitError{}),
+			expectedRunErr:    ptr(exec.ExitError{}),
+			expectedExitCode:  ptr("-1"),
+			expectedWrotefile: ptr("postfile"),
+			expectedStatus: []result.RunResult{
+				{
+					Key:        "ExitCode",
+					Value:      "-1",
+					ResultType: result.InternalTektonResultType,
+				},
+				{
+					Key:        "StartedAt",
+					ResultType: result.InternalTektonResultType,
+				},
+			},
+		},
+		{
+			desc:              "reason errored",
+			runError:          ptr(exec.Error{}),
+			expectedRunErr:    ptr(exec.Error{}),
+			expectedWrotefile: ptr("postfile.err"),
+			expectedStatus: []result.RunResult{
+				{
+					Key:        "StartedAt",
+					ResultType: result.InternalTektonResultType,
+				},
+			},
+		},
+		{
+			desc:              "reason timedout",
+			runError:          ErrContextDeadlineExceeded,
+			expectedRunErr:    ErrContextDeadlineExceeded,
+			expectedWrotefile: ptr("postfile.err"),
+			expectedStatus: []result.RunResult{
+				{
+					Key:        "Reason",
+					Value:      pod.TerminationReasonTimeoutExceeded,
+					ResultType: result.InternalTektonResultType,
+				},
+				{
+					Key:        "StartedAt",
+					ResultType: result.InternalTektonResultType,
+				},
+			},
+		},
+		{
+			desc:              "reason skipped",
+			waitFiles:         []string{"file"},
+			expectedRunErr:    ErrSkipPreviousStepFailed,
+			expectedWrotefile: ptr("postfile.err"),
+			expectedStatus: []result.RunResult{
+				{
+					Key:        "Reason",
+					Value:      pod.TerminationReasonSkipped,
+					ResultType: result.InternalTektonResultType,
+				},
+				{
+					Key:        "StartedAt",
+					ResultType: result.InternalTektonResultType,
+				},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.desc, func(t *testing.T) {
+			fw, fr, fpw := &fakeWaiter{skipStep: true}, &fakeRunner{runError: test.runError}, &fakePostWriter{}
+
+			tmpFolder, err := os.MkdirTemp("", "")
+			if err != nil {
+				t.Fatalf("unexpected error creating temporary folder: %v", err)
+			} else {
+				defer os.RemoveAll(tmpFolder)
+			}
+
+			terminationFile, err := os.CreateTemp(tmpFolder, "termination")
+			if err != nil {
+				t.Fatalf("unexpected error creating termination file: %v", err)
+			}
+
+			e := Entrypointer{
+				Command:             append([]string{}, []string{}...),
+				WaitFiles:           test.waitFiles,
+				PostFile:            "postfile",
+				Waiter:              fw,
+				Runner:              fr,
+				PostWriter:          fpw,
+				TerminationPath:     terminationFile.Name(),
+				BreakpointOnFailure: false,
+				StepMetadataDir:     tmpFolder,
+				OnError:             test.onError,
+			}
+
+			err = e.Go()
+
+			if d := cmp.Diff(test.expectedRunErr, err); d != "" {
+				t.Fatalf("entrypoint error doesn't match %s", diff.PrintWantGot(d))
+			}
+
+			if d := cmp.Diff(test.expectedExitCode, fpw.exitCode); d != "" {
+				t.Fatalf("exitCode doesn't match %s", diff.PrintWantGot(d))
+			}
+
+			if d := cmp.Diff(test.expectedWrotefile, fpw.wrote); d != "" {
+				t.Fatalf("wrote file doesn't match %s", diff.PrintWantGot(d))
+			}
+
+			termination, err := getTermination(t, terminationFile.Name())
+			if err != nil {
+				t.Fatalf("error getting termination output: %v", err)
+			}
+
+			if d := cmp.Diff(test.expectedStatus, termination); d != "" {
+				t.Fatalf("termination status doesn't match %s", diff.PrintWantGot(d))
+			}
+		})
+	}
+}
+
+func TestReadArtifactsFileDoesNotExist(t *testing.T) {
+	t.Run("readArtifact file doesn't exist, empty result, no error.", func(t *testing.T) {
+		dir := createTmpDir(t, "")
+		fp := filepath.Join(dir, "provenance.json")
+		got, err := readArtifacts(fp)
+
+		if err != nil {
+			t.Fatalf("Did not expect and error but got: %v", err)
+		}
+
+		want := []result.RunResult{}
+		if d := cmp.Diff(want, got); d != "" {
+			t.Fatalf("artifacts don't match %s", diff.PrintWantGot(d))
+		}
+	})
+}
+
+func TestReadArtifactsFileExistNoError(t *testing.T) {
+	t.Run("readArtifact file exist", func(t *testing.T) {
+		dir := createTmpDir(t, "")
+		fp := filepath.Join(dir, "provenance.json")
+		err := os.WriteFile(fp, []byte{}, 0755)
+		if err != nil {
+			t.Fatalf("Did not expect and error but got: %v", err)
+		}
+		got, err := readArtifacts(fp)
+
+		if err != nil {
+			t.Fatalf("Did not expect and error but got: %v", err)
+		}
+
+		want := []result.RunResult{{Key: fp, Value: "", ResultType: 5}}
+		if d := cmp.Diff(want, got); d != "" {
+			t.Fatalf("artifacts don't match %s", diff.PrintWantGot(d))
+		}
+	})
+}
+
+func TestReadArtifactsFileExistReadError(t *testing.T) {
+	t.Run("readArtifact file exist", func(t *testing.T) {
+		if os.Getuid() == 0 {
+			t.Skipf("Test doesn't work when running with root")
+		}
+		dir := createTmpDir(t, "")
+		fp := filepath.Join(dir, "provenance.json")
+		err := os.WriteFile(fp, []byte{}, 0000)
+		if err != nil {
+			t.Fatalf("Did not expect and error but got: %v", err)
+		}
+		got, err := readArtifacts(fp)
+
+		if err == nil {
+			t.Fatalf("expecting error but got nil")
+		}
+
+		var want []result.RunResult
+		if d := cmp.Diff(want, got); d != "" {
+			t.Fatalf("artifacts don't match %s", diff.PrintWantGot(d))
+		}
+	})
+}
+
+func TestGetStepArtifactsPath(t *testing.T) {
+	t.Run("test get step artifacts path", func(t *testing.T) {
+		got := getStepArtifactsPath("a", "b")
+		want := "a/b/artifacts/provenance.json"
+		if d := cmp.Diff(want, got); d != "" {
+			t.Fatalf("path doesn't match %s", diff.PrintWantGot(d))
+		}
+	})
+}
+
+func TestLoadStepArtifacts(t *testing.T) {
+	tests := []struct {
+		desc        string
+		wantErr     bool
+		want        v1.Artifacts
+		fileContent string
+		mode        os.FileMode
+	}{
+		{
+			desc:        "read artifact success",
+			fileContent: `{"inputs":[{"name":"inputs","values":[{"digest":{"sha256":"cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"},"uri":"pkg:example.github.com/inputs"}]}],"outputs":[{"name":"output","values":[{"digest":{"sha256":"64d0b157fdf2d7f6548836dd82085fd8401c9481a9f59e554f1b337f134074b0"},"uri":"docker:example.registry.com/outputs"}]}]}`,
+			want: v1.Artifacts{
+				Inputs: []v1.Artifact{{Name: "inputs", Values: []v1.ArtifactValue{{
+					Digest: map[v1.Algorithm]string{"sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"},
+					Uri:    "pkg:example.github.com/inputs",
+				}}}},
+				Outputs: []v1.Artifact{{Name: "output", Values: []v1.ArtifactValue{{
+					Digest: map[v1.Algorithm]string{"sha256": "64d0b157fdf2d7f6548836dd82085fd8401c9481a9f59e554f1b337f134074b0"},
+					Uri:    "docker:example.registry.com/outputs",
+				}}}},
+			},
+			mode: 0755,
+		},
+		{
+			desc:    "read artifact file doesn't exist, error",
+			want:    v1.Artifacts{},
+			wantErr: true,
+		},
+		{
+			desc:        "read artifact, mal-formatted json, error",
+			fileContent: `{\\`,
+			mode:        0755,
+			wantErr:     true,
+		},
+		{
+			desc:        "read artifact, file cannot be read, error",
+			fileContent: `{"inputs":[{"name":"inputs","values":[{"digest":{"sha256":"cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"},"uri":"pkg:example.github.com/inputs"}]}],"outputs":[{"name":"output","values":[{"digest":{"sha256":"64d0b157fdf2d7f6548836dd82085fd8401c9481a9f59e554f1b337f134074b0"},"uri":"docker:example.registry.com/outputs"}]}]}`,
+			mode:        0000,
+			wantErr:     true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.desc, func(t *testing.T) {
+			if tc.mode == 0000 && os.Getuid() == 0 {
+				t.Skipf("Test doesn't work when running with root")
+			}
+			dir := createTmpDir(t, "")
+			name := "step-name"
+			artifactsPath := getStepArtifactsPath(dir, name)
+			if tc.fileContent != "" {
+				err := os.MkdirAll(filepath.Dir(artifactsPath), 0755)
+				if err != nil {
+					t.Fatalf("fail to create dir %v", err)
+				}
+				err = os.WriteFile(artifactsPath, []byte(tc.fileContent), tc.mode)
+				if err != nil {
+					return
+				}
+			}
+			got, err := loadStepArtifacts(dir, name)
+
+			if tc.wantErr != (err != nil) {
+				t.Fatalf("Error checking failed %v", err)
+			}
+			if d := cmp.Diff(tc.want, got); d != "" {
+				t.Fatalf("artifacts don't match %s", diff.PrintWantGot(d))
+			}
+		})
+	}
+}
+
+func TestParseArtifactTemplate(t *testing.T) {
+	tests := []struct {
+		desc    string
+		input   string
+		want    ArtifactTemplate
+		wantErr bool
+	}{
+		{
+			desc:  "valid outputs template with artifact name",
+			input: "$(steps.name.outputs.aaa)",
+			want: ArtifactTemplate{
+				ContainerName: "step-name",
+				Type:          "outputs",
+				ArtifactName:  "aaa",
+			},
+		},
+		{
+			desc:  "valid outputs template without artifact name",
+			input: "$(steps.name.outputs)",
+			want: ArtifactTemplate{
+				Type:          "outputs",
+				ContainerName: "step-name",
+			},
+		},
+		{
+			desc:  "valid inputs template with artifact name",
+			input: "$(steps.name.inputs.aaa)",
+			want: ArtifactTemplate{
+				ContainerName: "step-name",
+				Type:          "inputs",
+				ArtifactName:  "aaa",
+			},
+		},
+		{
+			desc:  "valid outputs template without artifact name",
+			input: "$(steps.name.inputs)",
+			want: ArtifactTemplate{
+				Type:          "inputs",
+				ContainerName: "step-name",
+			},
+		},
+		{
+			desc:    "invalid template without artifact name, no prefix and suffix",
+			input:   "steps.name.outputs",
+			wantErr: true,
+		},
+		{
+			desc:    "invalid template with artifact name, no prefix and suffix",
+			input:   "steps.name.outputs.aaa",
+			wantErr: true,
+		},
+		{
+			desc:    "invalid template with 5 segments",
+			input:   "$(steps.name.outputs.aaa.sss)",
+			wantErr: true,
+		},
+		{
+			desc:    "invalid template with 2 segments",
+			input:   "$(steps.name)",
+			wantErr: true,
+		},
+		{
+			desc:    "invalid template concatenated with valid template",
+			input:   "aaa$(steps.name.outputs.aaa)",
+			wantErr: true,
+		},
+		{
+			desc:    "invalid template segment 3 is not correct",
+			input:   "$(steps.name.xxxx.aaa)",
+			wantErr: true,
+		},
+		{
+			desc:    "invalid template -- two valid template concatenation",
+			input:   "$(steps.name.outputs.aaa)$(steps.name.outputs.aaa)",
+			wantErr: true,
+		},
+		{
+			desc:    "invalid template -- empty",
+			input:   "",
+			wantErr: true,
+		},
+		{
+			desc:    "invalid template -- extra )",
+			input:   "$(steps.name.outputs.aaa))",
+			wantErr: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.desc, func(t *testing.T) {
+			got, err := parseArtifactTemplate(tc.input)
+			if tc.wantErr != (err != nil) {
+				t.Fatalf("Error checking failed %v", err)
+			}
+			if d := cmp.Diff(tc.want, got); d != "" {
+				t.Fatalf("ArtifactTemplate doesn't match %s", diff.PrintWantGot(d))
+			}
+		})
+	}
+}
+
+func TestGetArtifactValues(t *testing.T) {
+	name := "name"
+
+	tests := []struct {
+		desc        string
+		wantErr     bool
+		want        string
+		fileContent string
+		mode        os.FileMode
+		template    string
+	}{
+		{
+			desc:        "read outputs artifact without artifact name, success",
+			fileContent: `{"inputs":[{"name":"inputs","values":[{"digest":{"sha256":"cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"},"uri":"pkg:example.github.com/inputs"}]}],"outputs":[{"name":"output","values":[{"digest":{"sha256":"64d0b157fdf2d7f6548836dd82085fd8401c9481a9f59e554f1b337f134074b0"},"uri":"docker:example.registry.com/outputs"}]}]}`,
+			want:        `[{"digest":{"sha256":"64d0b157fdf2d7f6548836dd82085fd8401c9481a9f59e554f1b337f134074b0"},"uri":"docker:example.registry.com/outputs"}]`,
+			mode:        0755,
+			template:    fmt.Sprintf("$(steps.%s.outputs)", name),
+		},
+		{
+			desc:        "read inputs artifact without artifact name, success",
+			fileContent: `{"inputs":[{"name":"inputs","values":[{"digest":{"sha256":"cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"},"uri":"pkg:example.github.com/inputs"}]}],"outputs":[{"name":"output","values":[{"digest":{"sha256":"64d0b157fdf2d7f6548836dd82085fd8401c9481a9f59e554f1b337f134074b0"},"uri":"docker:example.registry.com/outputs"}]}]}`,
+			want:        `[{"digest":{"sha256":"cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"},"uri":"pkg:example.github.com/inputs"}]`,
+			mode:        0755,
+			template:    fmt.Sprintf("$(steps.%s.inputs)", name),
+		},
+		{
+			desc:        "read outputs artifact without artifact name, multiple outputs, default to first",
+			fileContent: `{"inputs":[{"name":"inputs","values":[{"digest":{"sha256":"cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"},"uri":"pkg:example.github.com/inputs"}]}],"outputs":[{"name":"output","values":[{"digest":{"sha256":"64d0b157fdf2d7f6548836dd82085fd8401c9481a9f59e554f1b337f134074b0"},"uri":"docker:example.registry.com/outputs"}]},{"name":"output2","values":[{"digest":{"sha256":"22222157fdf2d7f6548836dd82085fd8401c9481a9f59e554f1b337f13402222"},"uri":"docker2:example.registry.com/outputs"}]}]}`,
+			want:        `[{"digest":{"sha256":"64d0b157fdf2d7f6548836dd82085fd8401c9481a9f59e554f1b337f134074b0"},"uri":"docker:example.registry.com/outputs"}]`,
+			mode:        0755,
+			template:    fmt.Sprintf("$(steps.%s.outputs)", name),
+		},
+		{
+			desc:        "read inputs artifact without artifact name, multiple outputs, default to first",
+			fileContent: `{"outputs":[{"name":"out","values":[{"digest":{"sha256":"cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"},"uri":"pkg:example.github.com/inputs"}]}],"inputs":[{"name":"in","values":[{"digest":{"sha256":"64d0b157fdf2d7f6548836dd82085fd8401c9481a9f59e554f1b337f134074b0"},"uri":"docker:example.registry.com/inputs"}]},{"name":"in2","values":[{"digest":{"sha256":"22222157fdf2d7f6548836dd82085fd8401c9481a9f59e554f1b337f13402222"},"uri":"docker2:example.registry.com/inputs"}]}]}`,
+			want:        `[{"digest":{"sha256":"64d0b157fdf2d7f6548836dd82085fd8401c9481a9f59e554f1b337f134074b0"},"uri":"docker:example.registry.com/inputs"}]`,
+			mode:        0755,
+			template:    fmt.Sprintf("$(steps.%s.inputs)", name),
+		},
+		{
+			desc:        "read outputs artifact with artifact name, success",
+			fileContent: `{"inputs":[{"name":"inputs","values":[{"digest":{"sha256":"cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"},"uri":"pkg:example.github.com/inputs"}]}],"outputs":[{"name":"output","values":[{"digest":{"sha256":"64d0b157fdf2d7f6548836dd82085fd8401c9481a9f59e554f1b337f134074b0"},"uri":"docker:example.registry.com/outputs"}]}]}`,
+			want:        `[{"digest":{"sha256":"64d0b157fdf2d7f6548836dd82085fd8401c9481a9f59e554f1b337f134074b0"},"uri":"docker:example.registry.com/outputs"}]`,
+			mode:        0755,
+			template:    fmt.Sprintf("$(steps.%s.outputs.output)", name),
+		},
+		{
+			desc:        "read inputs artifact with artifact name, success",
+			fileContent: `{"outputs":[{"name":"outputs","values":[{"digest":{"sha256":"cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"},"uri":"pkg:example.github.com/outputs"}]}],"inputs":[{"name":"input","values":[{"digest":{"sha256":"64d0b157fdf2d7f6548836dd82085fd8401c9481a9f59e554f1b337f134074b0"},"uri":"docker:example.registry.com/inputs"}]}]}`,
+			want:        `[{"digest":{"sha256":"64d0b157fdf2d7f6548836dd82085fd8401c9481a9f59e554f1b337f134074b0"},"uri":"docker:example.registry.com/inputs"}]`,
+			mode:        0755,
+			template:    fmt.Sprintf("$(steps.%s.inputs.input)", name),
+		},
+		{
+			desc:        "read outputs artifact with artifact name, multiple outputs, success",
+			fileContent: `{"inputs":[{"name":"inputs","values":[{"digest":{"sha256":"cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"},"uri":"pkg:example.github.com/inputs"}]}],"outputs":[{"name":"output","values":[{"digest":{"sha256":"64d0b157fdf2d7f6548836dd82085fd8401c9481a9f59e554f1b337f134074b0"},"uri":"docker:example.registry.com/outputs"}]},{"name":"output2","values":[{"digest":{"sha256":"22222157fdf2d7f6548836dd82085fd8401c9481a9f59e554f1b337f13402222"},"uri":"docker2:example.registry.com/outputs"}]}]}`,
+			want:        `[{"digest":{"sha256":"22222157fdf2d7f6548836dd82085fd8401c9481a9f59e554f1b337f13402222"},"uri":"docker2:example.registry.com/outputs"}]`,
+			mode:        0755,
+			template:    fmt.Sprintf("$(steps.%s.outputs.output2)", name),
+		},
+		{
+			desc:        "read inputs artifact with artifact name, multiple inputs, success",
+			fileContent: `{"outputs":[{"name":"outputs","values":[{"digest":{"sha256":"cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"},"uri":"pkg:example.github.com/outputs"}]}],"inputs":[{"name":"input","values":[{"digest":{"sha256":"64d0b157fdf2d7f6548836dd82085fd8401c9481a9f59e554f1b337f134074b0"},"uri":"docker:example.registry.com/inputs"}]},{"name":"input2","values":[{"digest":{"sha256":"22222157fdf2d7f6548836dd82085fd8401c9481a9f59e554f1b337f13402222"},"uri":"docker2:example.registry.com/inputs"}]}]}`,
+			want:        `[{"digest":{"sha256":"22222157fdf2d7f6548836dd82085fd8401c9481a9f59e554f1b337f13402222"},"uri":"docker2:example.registry.com/inputs"}]`,
+			mode:        0755,
+			template:    fmt.Sprintf("$(steps.%s.inputs.input2)", name),
+		},
+		{
+			desc:        "invalid template",
+			fileContent: `{"inputs":[{"name":"inputs","values":[{"digest":{"sha256":"cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"},"uri":"pkg:example.github.com/inputs"}]}],"outputs":[{"name":"output","values":[{"digest":{"sha256":"64d0b157fdf2d7f6548836dd82085fd8401c9481a9f59e554f1b337f134074b0"},"uri":"docker:example.registry.com/outputs"}]},{"name":"output2","values":[{"digest":{"sha256":"22222157fdf2d7f6548836dd82085fd8401c9481a9f59e554f1b337f13402222"},"uri":"docker2:example.registry.com/outputs"}]}]}`,
+			mode:        0755,
+			template:    fmt.Sprintf("$(steps.%s.outputs.output2.333)", name),
+			wantErr:     true,
+		},
+		{
+			desc:        "fail to load artifacts",
+			fileContent: `{"inputs":[{"name":"inputs","values":[{"digest":{"sha256":"cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"},"uri":"pkg:example.github.com/inputs"}]}],"outputs":[{"name":"output","values":[{"digest":{"sha256":"64d0b157fdf2d7f6548836dd82085fd8401c9481a9f59e554f1b337f134074b0"},"uri":"docker:example.registry.com/outputs"}]},{"name":"output2","values":[{"digest":{"sha256":"22222157fdf2d7f6548836dd82085fd8401c9481a9f59e554f1b337f13402222"},"uri":"docker2:example.registry.com/outputs"}]}]}`,
+			mode:        0000,
+			template:    fmt.Sprintf("$(steps.%s.outputs.output2.333)", name),
+			wantErr:     true,
+		},
+		{
+			desc:        "template not found",
+			fileContent: `{"inputs":[{"name":"inputs","values":[{"digest":{"sha256":"cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"},"uri":"pkg:example.github.com/inputs"}]}],"outputs":[{"name":"output","values":[{"digest":{"sha256":"64d0b157fdf2d7f6548836dd82085fd8401c9481a9f59e554f1b337f134074b0"},"uri":"docker:example.registry.com/outputs"}]},{"name":"output2","values":[{"digest":{"sha256":"22222157fdf2d7f6548836dd82085fd8401c9481a9f59e554f1b337f13402222"},"uri":"docker2:example.registry.com/outputs"}]}]}`,
+			mode:        0755,
+			template:    fmt.Sprintf("$(steps.%s.outputs.output3)", name),
+			wantErr:     true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.desc, func(t *testing.T) {
+			if tc.mode == 0000 && os.Getuid() == 0 {
+				t.Skipf("Test doesn't work when running with root")
+			}
+			dir := createTmpDir(t, "")
+			artifactsPath := getStepArtifactsPath(dir, "step-"+name)
+			if tc.fileContent != "" {
+				err := os.MkdirAll(filepath.Dir(artifactsPath), 0755)
+				if err != nil {
+					t.Fatalf("fail to create dir %v", err)
+				}
+				err = os.WriteFile(artifactsPath, []byte(tc.fileContent), tc.mode)
+				if err != nil {
+					t.Fatalf("fail to write to file %v", err)
+				}
+			}
+
+			got, err := getArtifactValues(dir, tc.template)
+			if tc.wantErr != (err != nil) {
+				t.Fatalf("Error checking failed %v", err)
+			}
+
+			if d := cmp.Diff(tc.want, got); d != "" {
+				t.Fatalf("artifactValues don't match %s", diff.PrintWantGot(d))
+			}
+		})
+	}
+}
+
+func TestApplyStepArtifactSubstitutionsCommandSuccess(t *testing.T) {
+	stepName := "name"
+	scriptDir := createTmpDir(t, "script")
+	cur := ScriptDir
+	ScriptDir = scriptDir
+	t.Cleanup(func() {
+		ScriptDir = cur
+	})
+
+	tests := []struct {
+		desc          string
+		wantErr       bool
+		want          string
+		fileContent   string
+		mode          os.FileMode
+		scriptContent string
+		scriptFile    string
+		command       []string
+	}{
+		{
+			desc:          "apply substitution to command from script file, success",
+			fileContent:   `{"inputs":[{"name":"inputs","values":[{"digest":{"sha256":"cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"},"uri":"pkg:example.github.com/inputs"}]}],"outputs":[{"name":"output","values":[{"digest":{"sha256":"64d0b157fdf2d7f6548836dd82085fd8401c9481a9f59e554f1b337f134074b0"},"uri":"docker:example.registry.com/outputs"}]}]}`,
+			want:          `echo [{"digest":{"sha256":"64d0b157fdf2d7f6548836dd82085fd8401c9481a9f59e554f1b337f134074b0"},"uri":"docker:example.registry.com/outputs"}]`,
+			mode:          0755,
+			scriptContent: fmt.Sprintf("echo $(steps.%s.outputs)", stepName),
+			scriptFile:    filepath.Join(scriptDir, "foo.sh"),
+			command:       []string{filepath.Join(scriptDir, "foo.sh")},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.desc, func(t *testing.T) {
+			stepDir := createTmpDir(t, "")
+			artifactsPath := getStepArtifactsPath(stepDir, "step-"+stepName)
+			if tc.fileContent != "" {
+				err := os.MkdirAll(filepath.Dir(artifactsPath), 0755)
+				if err != nil {
+					t.Fatalf("fail to create stepDir %v", err)
+				}
+				err = os.WriteFile(artifactsPath, []byte(tc.fileContent), tc.mode)
+				if err != nil {
+					t.Fatalf("fail to write to file %v", err)
+				}
+			}
+			if tc.scriptContent != "" {
+				err := os.WriteFile(tc.scriptFile, []byte(tc.scriptContent), 0755)
+				if err != nil {
+					t.Fatalf("failed to write script to scriptFile %v", err)
+				}
+			}
+			e := Entrypointer{Command: tc.command}
+			err := e.applyStepArtifactSubstitutions(stepDir)
+			if tc.wantErr != (err != nil) {
+				t.Fatalf("Error checking failed %v", err)
+			}
+			got, err := os.ReadFile(e.Command[0])
+			if err != nil {
+				t.Fatalf("faile to read replaced script file %v", err)
+			}
+
+			if d := cmp.Diff(tc.want, string(got)); d != "" {
+				t.Fatalf("command doesn't match %s", diff.PrintWantGot(d))
+			}
+		})
+	}
+}
+func TestApplyStepArtifactSubstitutionsCommand(t *testing.T) {
+	stepName := "name"
+	scriptDir := createTmpDir(t, "script")
+	cur := ScriptDir
+	ScriptDir = scriptDir
+	t.Cleanup(func() {
+		ScriptDir = cur
+	})
+
+	tests := []struct {
+		desc          string
+		wantErr       bool
+		want          []string
+		fileContent   string
+		mode          os.FileMode
+		scriptContent string
+		scriptFile    string
+		command       []string
+	}{
+		{
+			desc:          "apply substitution script, fail to read artifacts",
+			fileContent:   `{"inputs":[{"name":"inputs","values":[{"digest":{"sha256":"cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"},"uri":"pkg:example.github.com/inputs"}]}],"outputs":[{"name":"output","values":[{"digest":{"sha256":"64d0b157fdf2d7f6548836dd82085fd8401c9481a9f59e554f1b337f134074b0"},"uri":"docker:example.registry.com/outputs"}]}]}`,
+			want:          []string{filepath.Join(scriptDir, "foo2.sh")},
+			mode:          0000,
+			wantErr:       true,
+			scriptContent: fmt.Sprintf("echo $(steps.%s.outputs)", stepName),
+			scriptFile:    filepath.Join(scriptDir, "foo2.sh"),
+			command:       []string{filepath.Join(scriptDir, "foo2.sh")},
+		},
+		{
+			desc:          "apply substitution to command from script file , no matches success",
+			fileContent:   `{"inputs":[{"name":"inputs","values":[{"digest":{"sha256":"cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"},"uri":"pkg:example.github.com/inputs"}]}],"outputs":[{"name":"output","values":[{"digest":{"sha256":"64d0b157fdf2d7f6548836dd82085fd8401c9481a9f59e554f1b337f134074b0"},"uri":"docker:example.registry.com/outputs"}]}]}`,
+			want:          []string{filepath.Join(scriptDir, "bar.sh")},
+			mode:          0755,
+			scriptContent: "echo 123",
+			scriptFile:    filepath.Join(scriptDir, "bar.sh"),
+			command:       []string{filepath.Join(scriptDir, "bar.sh")},
+		},
+		{
+			desc:        "apply substitution to inline command, success",
+			fileContent: `{"inputs":[{"name":"inputs","values":[{"digest":{"sha256":"cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"},"uri":"pkg:example.github.com/inputs"}]}],"outputs":[{"name":"output","values":[{"digest":{"sha256":"64d0b157fdf2d7f6548836dd82085fd8401c9481a9f59e554f1b337f134074b0"},"uri":"docker:example.registry.com/outputs"}]}]}`,
+			want:        []string{"echo", `[{"digest":{"sha256":"64d0b157fdf2d7f6548836dd82085fd8401c9481a9f59e554f1b337f134074b0"},"uri":"docker:example.registry.com/outputs"}]`, "|", "jq", "."},
+			mode:        0755,
+			command:     []string{"echo", fmt.Sprintf("$(steps.%s.outputs)", stepName), "|", "jq", "."},
+		},
+		{
+			desc:        "apply substitution to inline command, fail to read, command no change",
+			fileContent: `{"inputs":[{"name":"inputs","values":[{"digest":{"sha256":"cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"},"uri":"pkg:example.github.com/inputs"}]}],"outputs":[{"name":"output","values":[{"digest":{"sha256":"64d0b157fdf2d7f6548836dd82085fd8401c9481a9f59e554f1b337f134074b0"},"uri":"docker:example.registry.com/outputs"}]}]}`,
+			want:        []string{"echo", fmt.Sprintf("$(steps.%s.outputs)", stepName), "|", "jq", "."},
+			mode:        0000,
+			wantErr:     true,
+			command:     []string{"echo", fmt.Sprintf("$(steps.%s.outputs)", stepName), "|", "jq", "."},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.desc, func(t *testing.T) {
+			if tc.mode == 0000 && os.Getuid() == 0 {
+				t.Skipf("Test doesn't work when running with root")
+			}
+			stepDir := createTmpDir(t, "")
+			artifactsPath := getStepArtifactsPath(stepDir, "step-"+stepName)
+			if tc.fileContent != "" {
+				err := os.MkdirAll(filepath.Dir(artifactsPath), 0755)
+				if err != nil {
+					t.Fatalf("fail to create stepDir %v", err)
+				}
+				err = os.WriteFile(artifactsPath, []byte(tc.fileContent), tc.mode)
+				if err != nil {
+					t.Fatalf("fail to write to file %v", err)
+				}
+			}
+			if tc.scriptContent != "" {
+				err := os.WriteFile(tc.scriptFile, []byte(tc.scriptContent), 0755)
+				if err != nil {
+					t.Fatalf("failed to write script to scriptFile %v", err)
+				}
+			}
+			e := Entrypointer{Command: tc.command}
+			err := e.applyStepArtifactSubstitutions(stepDir)
+			if tc.wantErr != (err != nil) {
+				t.Fatalf("Error checking failed %v", err)
+			}
+			got := e.Command
+
+			if d := cmp.Diff(tc.want, got); d != "" {
+				t.Fatalf("command doesn't match %s", diff.PrintWantGot(d))
+			}
+		})
+	}
+}
+
+func TestApplyStepArtifactSubstitutionsEnv(t *testing.T) {
+	stepName := "name"
+	scriptDir := createTmpDir(t, "script")
+	cur := ScriptDir
+	ScriptDir = scriptDir
+	t.Cleanup(func() {
+		ScriptDir = cur
+	})
+	tests := []struct {
+		desc        string
+		wantErr     bool
+		want        string
+		fileContent string
+		mode        os.FileMode
+		envKey      string
+		envValue    string
+	}{
+		{
+			desc:        "apply substitution to env, no matches, no changes",
+			fileContent: `{"inputs":[{"name":"inputs","values":[{"digest":{"sha256":"cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"},"uri":"pkg:example.github.com/inputs"}]}],"outputs":[{"name":"output","values":[{"digest":{"sha256":"64d0b157fdf2d7f6548836dd82085fd8401c9481a9f59e554f1b337f134074b0"},"uri":"docker:example.registry.com/outputs"}]}]}`,
+			mode:        0755,
+			envKey:      "aaa",
+			envValue:    "bbb",
+			want:        "bbb",
+		},
+		{
+			desc:        "apply substitution to env, matches found, has change",
+			fileContent: `{"inputs":[{"name":"inputs","values":[{"digest":{"sha256":"cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"},"uri":"pkg:example.github.com/inputs"}]}],"outputs":[{"name":"output","values":[{"digest":{"sha256":"64d0b157fdf2d7f6548836dd82085fd8401c9481a9f59e554f1b337f134074b0"},"uri":"docker:example.registry.com/outputs"}]}]}`,
+			mode:        0755,
+			envKey:      "aaa",
+			envValue:    fmt.Sprintf("abc-$(steps.%s.outputs)", stepName),
+			want:        `abc-[{"digest":{"sha256":"64d0b157fdf2d7f6548836dd82085fd8401c9481a9f59e554f1b337f134074b0"},"uri":"docker:example.registry.com/outputs"}]`,
+		},
+		{
+			desc:        "apply substitution to env, matches found, read artifacts failed.",
+			fileContent: `{"inputs":[{"name":"inputs","values":[{"digest":{"sha256":"cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"},"uri":"pkg:example.github.com/inputs"}]}],"outputs":[{"name":"output","values":[{"digest":{"sha256":"64d0b157fdf2d7f6548836dd82085fd8401c9481a9f59e554f1b337f134074b0"},"uri":"docker:example.registry.com/outputs"}]}]}`,
+			mode:        0000,
+			envKey:      "aaa",
+			envValue:    fmt.Sprintf("abc-$(steps.%s.outputs)", stepName),
+			want:        fmt.Sprintf("abc-$(steps.%s.outputs)", stepName),
+			wantErr:     true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.desc, func(t *testing.T) {
+			if tc.mode == 0000 && os.Getuid() == 0 {
+				t.Skipf("Test doesn't work when running with root")
+			}
+			stepDir := createTmpDir(t, "")
+			artifactsPath := getStepArtifactsPath(stepDir, "step-"+stepName)
+			if tc.fileContent != "" {
+				err := os.MkdirAll(filepath.Dir(artifactsPath), 0755)
+				if err != nil {
+					t.Fatalf("fail to create stepDir %v", err)
+				}
+				err = os.WriteFile(artifactsPath, []byte(tc.fileContent), tc.mode)
+				if err != nil {
+					t.Fatalf("fail to write to file %v", err)
+				}
+			}
+			e := Entrypointer{}
+			t.Setenv(tc.envKey, tc.envValue)
+			err := e.applyStepArtifactSubstitutions(stepDir)
+
+			if tc.wantErr != (err != nil) {
+				t.Fatalf("Error checking failed %v", err)
+			}
+			got := os.Getenv(tc.envKey)
+
+			if d := cmp.Diff(tc.want, got); d != "" {
+				t.Fatalf("env doesn't match %s", diff.PrintWantGot(d))
+			}
+		})
+	}
+}
+
+func getTermination(t *testing.T, terminationFile string) ([]result.RunResult, error) {
+	t.Helper()
+	fileContents, err := os.ReadFile(terminationFile)
+	if err != nil {
+		return nil, err
+	}
+
+	logger, _ := logging.NewLogger("", "status")
+	terminationStatus, err := termination.ParseMessage(logger, string(fileContents))
+	if err != nil {
+		return nil, err
+	}
+
+	for i, termination := range terminationStatus {
+		if termination.Key == "StartedAt" {
+			terminationStatus[i].Value = ""
+		}
+	}
+	return terminationStatus, nil
+}
+
+type fakeWaiter struct {
+	sync.Mutex
+	waited             []string
+	waitCancelDuration time.Duration
+	skipStep           bool
+}
+
+func (f *fakeWaiter) Wait(ctx context.Context, file string, _ bool, _ bool) error {
+	switch {
+	case file == pod.DownwardMountCancelFile && f.waitCancelDuration > 0:
+		time.Sleep(f.waitCancelDuration)
+	case file == pod.DownwardMountCancelFile:
+		return nil
+	case f.skipStep:
+		return ErrSkipPreviousStepFailed
+	}
+
+	f.Lock()
+	f.waited = append(f.waited, file)
+	f.Unlock()
+	return nil
+}
+
+type fakeRunner struct {
+	args     *[]string
+	runError error
+}
+
+func (f *fakeRunner) Run(ctx context.Context, args ...string) error {
+	f.args = &args
+	return f.runError
+}
+
+type fakePostWriter struct {
+	wrote        *string
+	exitCodeFile *string
+	exitCode     *string
+}
+
+func (f *fakePostWriter) Write(file, content string) {
+	if content == "" {
+		f.wrote = &file
+	} else {
+		f.exitCodeFile = &file
+		f.exitCode = &content
+	}
+}
+
+type fakeErrorWaiter struct{ waited *string }
+
+func (f *fakeErrorWaiter) Wait(ctx context.Context, file string, expectContent bool, breakpointOnFailure bool) error {
+	f.waited = &file
+	return errors.New("waiter failed")
+}
+
+type fakeErrorRunner struct{ args *[]string }
+
+func (f *fakeErrorRunner) Run(ctx context.Context, args ...string) error {
+	f.args = &args
+	return errors.New("runner failed")
+}
+
+type fakeZeroTimeoutRunner struct{ args *[]string }
+
+func (f *fakeZeroTimeoutRunner) Run(ctx context.Context, args ...string) error {
+	f.args = &args
+	if _, ok := ctx.Deadline(); ok == true {
+		return errors.New("context deadline should not be set with a zero timeout duration")
+	}
+	return errors.New("runner failed")
+}
+
+type fakeTimeoutRunner struct{ args *[]string }
+
+func (f *fakeTimeoutRunner) Run(ctx context.Context, args ...string) error {
+	f.args = &args
+	if _, ok := ctx.Deadline(); ok == false {
+		return errors.New("context deadline should have been set because of a timeout")
+	}
+	return errors.New("runner failed")
+}
+
+type fakeExitErrorRunner struct{ args *[]string }
+
+func (f *fakeExitErrorRunner) Run(ctx context.Context, args ...string) error {
+	f.args = &args
+	return exec.Command("ls", "/bogus/path").Run()
+}
+
+type fakeLongRunner struct {
+	runningDuration time.Duration
+	waitingDuration time.Duration
+}
+
+func (f *fakeLongRunner) Run(ctx context.Context, _ ...string) error {
+	if f.waitingDuration < f.runningDuration {
+		return ErrContextDeadlineExceeded
+	}
+	select {
+	case <-time.After(f.runningDuration):
+		return nil
+	case <-ctx.Done():
+		if errors.Is(ctx.Err(), context.Canceled) {
+			return ErrContextCanceled
+		}
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return ErrContextDeadlineExceeded
+		}
+		return nil
+	}
+}
+
+type fakeResultsWriter struct {
+	args           *[]string
+	resultsToWrite map[string]string
+}
+
+func (f *fakeResultsWriter) Run(ctx context.Context, args ...string) error {
+	f.args = &args
+	for k, v := range f.resultsToWrite {
+		err := os.WriteFile(k, []byte(v), 0o666)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func createTmpDir(t *testing.T, name string) string {
+	t.Helper()
+	tmpDir, err := os.MkdirTemp("", name)
+	if err != nil {
+		t.Fatalf("unexpected error creating temporary dir: %v", err)
+	}
+	return tmpDir
+}
+
+func getMockSpireClient(ctx context.Context) (spire.EntrypointerAPIClient, spire.ControllerAPIClient, *v1beta1.TaskRun) {
+	tr := &v1beta1.TaskRun{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "taskrun-example",
+			Namespace: "foo",
+		},
+		Spec: v1beta1.TaskRunSpec{
+			TaskRef: &v1beta1.TaskRef{
+				Name:       "taskname",
+				APIVersion: "a1",
+			},
+			ServiceAccountName: "test-sa",
+		},
+	}
+
+	sc := &spire.MockClient{}
+
+	_ = sc.CreateEntries(ctx, tr, nil, 10000)
+
+	// bootstrap with about 20 calls to sign which should be enough for testing
+	id := sc.GetIdentity(tr)
+	for i := 0; i < 20; i++ {
+		sc.SignIdentities = append(sc.SignIdentities, id)
+	}
+
+	return sc, sc, tr
+}
+
+func ptr[T any](value T) *T {
+	return &value
+}
